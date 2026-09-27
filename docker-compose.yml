@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    container_name: ai-secretary
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    # Раскомментируйте для webhook-режима на VPS (вместо long polling):
+    # ports:
+    #   - "8080:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
