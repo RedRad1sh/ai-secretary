@@ -140,8 +140,9 @@ class Database:
                            remind_at: str, minutes_before: int) -> None:
         await self.db.execute(
             "INSERT INTO reminders (event_pk, title, start_iso, remind_at, minutes_before) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (event_pk, title, start_iso, remind_at, minutes_before),
+            "SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS "
+            "(SELECT 1 FROM reminders WHERE event_pk = ? AND start_iso = ? AND minutes_before = ?)",
+            (event_pk, title, start_iso, remind_at, minutes_before, event_pk, start_iso, minutes_before),
         )
         await self.db.commit()
 

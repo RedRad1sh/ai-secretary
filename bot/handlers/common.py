@@ -15,7 +15,7 @@ class OwnerFilter(BaseFilter):
         user = event.from_user
         if user is None:
             return False
-        return cfg.allowed_user_id is None or user.id == cfg.allowed_user_id
+        return cfg.is_allowed(user.id)
 
 
 async def get_tz_name(db, cfg: Config | None) -> str:

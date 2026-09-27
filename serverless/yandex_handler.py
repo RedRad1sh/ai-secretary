@@ -28,7 +28,7 @@ _db = None
 
 
 def _init() -> None:
-    global _bot, _dp, _loop, _cfg
+    global _bot, _dp, _loop, _cfg, _db
     if _bot is not None:
         return
 
@@ -45,7 +45,6 @@ def _init() -> None:
     from bot import reminders
     from bot.db import Database
     from bot.main import build_dispatcher
-    from bot.services.gcal import GCalClient
     from bot.services.llm import create_llm_client
 
     # В функции вместо .env читаем переменные окружения напрямую
@@ -64,15 +63,14 @@ def _init() -> None:
     _bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     _dp = build_dispatcher(
         cfg, db, create_llm_client(cfg),
-        GCalClient(cfg.google_client_id, cfg.google_client_secret, cfg.google_refresh_token)
-        if cfg.google_ready else None,
+        None,  # OAuth отложен; .ics для всех пользователей
     )
     log.info(
         "Бот инициализирован. ALLOWED_USER_ID=%s, LLM=%s (model=%s), Google=%s",
         cfg.allowed_user_id,
         cfg.llm_api_url or ("нативный GigaChat" if cfg.giga_api_key else "OFF (офлайн-парсер)"),
         cfg.llm_model if cfg.llm_api_url else cfg.giga_model,
-        "подключён" if cfg.google_ready else "не настроен (.ics)",
+        "отложен (.ics)",
     )
 
 
@@ -119,7 +117,7 @@ async def _sweep_reminders() -> None:
     try:
         from bot import reminders
 
-        n = await reminders.sweep(_bot, _db, _cfg)
+        n = await reminders.sweep_all(_bot, _db, _cfg)
         if n:
             log.info("Отправлено напоминаний: %d", n)
     except Exception:  # noqa: BLE001

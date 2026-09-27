@@ -47,22 +47,23 @@ async def cmd_start(message: Message) -> None:
     await message.answer(
         "👋 <b>Я ваш AI-секретарь</b>.\n\n"
         "Пришлите текстом, голосом или пересылкой сообщение о встрече/деле — "
-        "я распознаю суть и предложу создать событие в Google Календаре.\n\n"
+        "я распознаю суть и предложу файл .ics для импорта в календарь.\n\n"
         "Примеры:\n"
         "• «встреча с Иваном завтра в 15:00 в офисе на Ленина, на час»\n"
         "• «созвон с командой каждую пятницу в 10:00»\n"
         "• 🎤 голосовое: «напомни послезавтра в два часа дня позвонить маме»\n\n"
         "<b>Команды:</b>\n"
-        "/today — события сегодня\n"
-        "/tomorrow — события завтра\n"
+        "/today — события сегодня (платный доступ)\n"
+        "/tomorrow — события завтра (платный доступ)\n"
         "/list — последние 10 созданных событий\n"
         "/undo — удалить последнее событие\n"
         "/settings — календарь, часовой пояс, напоминания\n"
-        "/stats — статистика\n"
+        "/stats — статистика (платный доступ)\n"
         "/cancel — сбросить диалог\n\n"
-        "<b>Слова-команды</b> (просто текстом):\n"
+        "<b>Слова-команды</b> (платный доступ):\n"
         "«отмени приём у терапевта» — отмена события\n"
-        "«перенеси встречу на 15:00» или «…на завтра в 10:30» — перенос"
+        "«перенеси встречу на 15:00» или «…на завтра в 10:30» — перенос\n\n"
+        "Несколько событий, повторы и OCR фото — платный доступ. Оплата пока не подключена."
     )
 
 
@@ -106,34 +107,12 @@ _RR_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
 
 def _rrule_occurrence(rrule: str, start: datetime, day0: datetime) -> datetime | None:
     """Вхождение повторяющегося события в конкретный день (или None)."""
-    freq, byday, interval = None, None, 1
-    for part in rrule.replace("RRULE:", "").split(";"):
-        if "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        if k == "FREQ":
-            freq = v.lower()
-        elif k == "BYDAY":
-            byday = {d.strip().upper() for d in v.split(",")}
-        elif k == "INTERVAL":
-            try:
-                interval = max(1, int(v))
-            except ValueError:
-                interval = 1
-    d0, anchor = day0.date(), start.date()
-    delta = (d0 - anchor).days
-    if delta < 0:
+    from dateutil.rrule import rrulestr
+    try:
+        candidate = rrulestr(rrule, dtstart=start).after(day0, inc=True)
+        return candidate if candidate and candidate.date() == day0.date() else None
+    except (ValueError, TypeError):
         return None
-    if freq == "daily":
-        ok = delta % interval == 0
-    elif freq == "weekly":
-        ok = (not byday or _RR_CODES[d0.weekday()] in byday) and (delta // 7) % interval == 0
-    elif freq == "monthly":
-        months = (d0.year - anchor.year) * 12 + (d0.month - anchor.month)
-        ok = d0.day == anchor.day and months % interval == 0
-    else:
-        ok = False
-    return datetime.combine(d0, start.time(), tzinfo=start.tzinfo) if ok else None
 
 
 async def _send_day(message: Message, db, cfg: Config, offset: int) -> None:

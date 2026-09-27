@@ -1,7 +1,7 @@
-# 🤖 AI-секретарь — Telegram-бот для Google Календаря
+# 🤖 AI-секретарь — Telegram-бот с экспортом .ics
 
 Персональный Telegram-бот: принимает текст, голос и пересланные сообщения на русском языке,
-извлекает через любой OpenAI-совместимый AI-API (ProxyAPI, VseGPT, OpenRouter, OpenAI, Ollama… или нативный GigaChat) информацию о встречах/делах/напоминаниях и создаёт события в Google Календаре.
+извлекает через любой OpenAI-совместимый AI-API (ProxyAPI, VseGPT, OpenRouter, OpenAI, Ollama… или нативный GigaChat) информацию о встречах/делах/напоминаниях и готовит файлы .ics для импорта в календарь. Автоматическая интеграция Google Calendar отложена.
 
 Реализует ТЗ: доступ из РФ без VPN, бесплатные AI-лимиты, подтверждение inline-кнопками, `/list`, `/undo`, `/settings`.
 
@@ -14,7 +14,7 @@
 | Текст («встреча с Иваном завтра в 15:00 в офисе на Ленина») | GigaChat извлекает JSON `{title, date, time, duration, location, description, participants, recurrence}` |
 | Пересланное сообщение | Текст (или caption) передаётся в AI-модуль |
 | Голосовое сообщение | Транскрибация через GigaChat Whisper (`/audio/transcriptions`), затем тот же пайплайн |
-| Изображение | Пока не поддерживается (этап 2 по ТЗ) |
+| Фото | OCR Tesseract rus+eng (платный whitelist), затем предпросмотр |
 | ⏰ Напоминания | Бот сам пишет в Telegram заранее («Через 10 мин…»); интервал — в /settings |
 
 Бот показывает карточку предпросмотра с кнопками **[✅ Создать] [✏️ Изменить] [❌ Отмена]**,
@@ -65,13 +65,13 @@ python -m bot.main
 ```
 
 1. Создайте бота у [@BotFather](https://t.me/BotFather) → получите `BOT_TOKEN`.
-2. Свой Telegram ID узнайте у [@userinfobot](https://t.me/userinfobot) → `ALLOWED_USER_ID` (бот игнорирует всех остальных).
+2. Свой Telegram ID узнайте у [@userinfobot](https://t.me/userinfobot) → `ALLOWED_USER_ID` для прежней базы владельца; `ALLOWED_USER_IDS` для общего списка и `PAID_USER_IDS` для платного доступа.
 3. AI: задайте в `.env` три переменные любого OpenAI-совместимого провайдера —
    `LLM_API_URL` + `LLM_API_KEY` + `LLM_MODEL` (примеры в `.env.example`:
    ProxyAPI и VseGPT — РФ и рубли; OpenRouter/OpenAI/DeepSeek; локальная Ollama —
    вообще без ключа). Проверка: `python scripts/test_llm.py`.
    Альтернатива — нативный GigaChat: ключ с [developers.sber.ru/gigachat](https://developers.sber.ru/gigachat).
-4. Google Календарь: выполните `python scripts/gcal_auth.py` (нужен `client_secret.json` из Google Cloud Console — пошагово в [docs/SETUP_GOOGLE.md](docs/SETUP_GOOGLE.md)) и вставьте `GOOGLE_REFRESH_TOKEN` в `.env`. Без этого шага бот работает в режиме `.ics`-файлов.
+4. Google OAuth на этом этапе не настраивайте: бот выдаёт .ics. Сохранённый код интеграции пока не используется обработчиками.
 
 ## Запуск на сервере (Docker)
 
@@ -109,7 +109,7 @@ docker compose logs -f
 
 - Все секреты — в переменных окружения (`.env`), в коде их нет.
 - Токены Google хранятся зашифрованными (Fernet, ключ в `ENCRYPTION_KEY` или `data/secret.key`).
-- Бот отвечает только на сообщения от `ALLOWED_USER_ID`.
+- Бот отвечает только whitelist в личных чатах. Пустой whitelist закрывает доступ. Данные новых пользователей — `data/users/<ID>.db`; прежняя `bot.db` принадлежит только `ALLOWED_USER_ID`.
 - TLS GigaChat: рекомендуется сертификат Минцифры (`GIGACHAT_CA_CERT`), `GIGACHAT_VERIFY_TLS=false` — только для старта.
 
 ## Тесты
@@ -127,3 +127,38 @@ python tests/test_smoke.py   # офлайн: нормализация дат, RR
 | Telegram Bot API | 0 ₽ |
 | Хостинг: Yandex Cloud Functions | **0 ₽/мес** |
 | Хостинг: самый дешёвый VDS (SprintHost / 4VPS / RuVDS) | 91–139 ₽/мес |
+
+
+## Доступ и эксплуатация (27.09.2026)
+
+Сначала заполните оба списка из `.env.example`. В `PAID_USER_IDS` сейчас укажите
+только свой **пользовательский** Telegram ID (не ID бота из лога).
+Общий доступ: одиночное событие, текст/голос/пересылка, .ics, настройки,
+`/list`, `/undo`, обычные напоминания. Платный: пакет событий, повторы,
+`/today`, `/tomorrow`, управление текстом, OCR, `/stats`.
+Платёжного провайдера, подписок и автоматических списаний пока нет.
+
+Для 24/7 выбран Docker/VDS с постоянным `./data`, **один экземпляр polling**.
+OCR в Docker установлен; при локальном запуске нужны `tesseract-ocr`,
+`tesseract-ocr-rus`, `tesseract-ocr-eng`. Фото ≤5 МБ, OCR ограничен 20 секундами.
+Текст с фото всегда проходит подтверждение; PDF и видео не распознаются.
+
+Ежедневный бэкап: `python scripts/backup.py /secure/backups` (в Docker —
+`docker compose exec bot python scripts/backup.py /app/data/backups`, затем
+копирование на другой носитель). Настройте cron/Task Scheduler самостоятельно.
+Скрипт использует SQLite backup API и включает все пользовательские БД и локальный
+`secret.key`; `.env`/внешний `ENCRYPTION_KEY` храните отдельно в защищённом хранилище.
+Восстановление: остановить бот, вернуть `bot.db`, `users/*.db` и ключ на прежние
+пути, восстановить прежний `ALLOWED_USER_ID`, запустить и проверить `/list`.
+Бэкапы содержат личные данные: не публикуйте их и ограничьте доступ.
+
+Webhook-адаптер сохранён, но `/tmp` в YC Functions **не является постоянной БД**.
+Без внешнего хранилища этот вариант не считается готовым для надёжных напоминаний.
+Подробности и незакрытые проверки: [дорожная карта](docs/ROADMAP.md).
+
+Проверки без сети:
+```bash
+python tests/test_smoke.py
+python tests/test_integration.py
+python -m unittest discover -s tests -p test_regressions.py
+```

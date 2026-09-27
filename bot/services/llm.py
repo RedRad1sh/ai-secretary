@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import time
 from collections import deque
 from typing import Any
@@ -73,7 +72,7 @@ class OpenAICompatClient:
     def __init__(self, cfg: Config, transport: httpx.AsyncBaseTransport | None = None):
         self.cfg = cfg
         self.base = cfg.llm_api_url.rstrip("/")
-        self._no_json_mode = False  # провайдер отказал в response_format -> не слать больше
+        self._no_json_models: set[str] = set()
         self._limiter = _RateLimiter(cfg.llm_rate_limit_rpm, 60.0)
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, connect=10.0),
@@ -108,143 +107,86 @@ class OpenAICompatClient:
     # ---------- chat/completions ----------
 
     async def chat(self, system: str, user: str, *,
-                   temperature: float = 0.1, max_tokens: int = 1024) -> str:
-        chain = self._model_chain()
-        last_err: Exception | None = None
+                   temperature: float = 0.1, max_tokens: int | None = None) -> str:
+        try:
+            return await asyncio.wait_for(
+                self._chat(system, user, temperature=temperature, max_tokens=max_tokens),
+                timeout=self.cfg.llm_total_timeout,
+            )
+        except asyncio.TimeoutError as e:
+            raise LLMError("исчерпан общий бюджет времени LLM; используем локальный парсер") from e
 
-        for model in chain:
-            for attempt in range(max(1, self.cfg.llm_max_retries)):
-                await self._limiter.acquire()
-                payload: dict[str, Any] = {
+    async def _chat(self, system, user, *, temperature, max_tokens):
+        last_err = LLMError("все LLM-модели исчерпаны")
+        for model in self._model_chain():
+            tokens = min(max_tokens or self.cfg.llm_max_tokens, self.cfg.llm_max_tokens_limit)
+            use_json = self.cfg.llm_json_mode and model not in self._no_json_models
+            failures = 0
+            empty_retry = False
+            while failures < max(1, self.cfg.llm_max_retries):
+                payload = {
                     "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
+                    "messages": [{"role": "system", "content": system},
+                                 {"role": "user", "content": user}],
+                    "temperature": temperature, "max_tokens": tokens,
                 }
-                if self.cfg.llm_json_mode and not self._no_json_mode:
+                if use_json:
                     payload["response_format"] = {"type": "json_object"}
-
+                await self._limiter.acquire()  # EVERY physical request counts
                 try:
                     resp = await self._post("/chat/completions", payload)
                 except LLMError as e:
                     last_err = e
-                    if attempt < self.cfg.llm_max_retries - 1:
-                        backoff = (1.5 ** attempt) + random.uniform(0, 0.5)
-                        log.warning("LLM сеть %s (%s) — ретрай %s/%s через %.1fs", model, e, attempt+1, self.cfg.llm_max_retries, backoff)
-                        await asyncio.sleep(backoff)
-                        continue
-                    break
-
-                # 429 / 5xx — ретраи с бэкоффом
-                if resp.status_code == 429 or 500 <= resp.status_code < 600:
-                    retry_after = _retry_after(resp)
-                    backoff = retry_after if retry_after is not None else (1.5 ** attempt + random.uniform(0, 0.5))
-                    is_last_attempt = attempt == self.cfg.llm_max_retries - 1
-                    log.warning("LLM %s: %s (попытка %s/%s) — жду %.1fs %s",
-                                model, f"{resp.status_code} {resp.text[:150]}",
-                                attempt+1, self.cfg.llm_max_retries, backoff,
-                                f"→ фолбек {chain[chain.index(model)+1]}" if is_last_attempt and model != chain[-1] else "")
-                    last_err = LLMError(f"{resp.status_code} {resp.text[:200]} ({_hint(resp.status_code)})")
-                    if not is_last_attempt:
-                        await asyncio.sleep(backoff)
-                        continue
-                    break
-
-                # 400 с response_format — выключаем json и повторяем
-                if resp.status_code == 400 and "response_format" in resp.text and "response_format" in payload:
-                    log.warning("Провайдер %s не поддержал response_format — повтор без json-режима", model)
-                    self._no_json_mode = True
-                    payload.pop("response_format", None)
-                    try:
-                        resp = await self._post("/chat/completions", payload)
-                    except LLMError as e:
-                        last_err = e
-                        break
-                    if resp.status_code != 200:
-                        last_err = LLMError(f"chat/completions: {resp.status_code} {resp.text[:200]} ({_hint(resp.status_code)})")
-                        if resp.status_code in (429, 500, 502, 503, 504):
-                            continue
-                        break
-
+                    failures += 1
+                    if failures < max(1, self.cfg.llm_max_retries):
+                        await asyncio.sleep(1.5 ** (failures - 1))
+                    continue
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    failures += 1
+                    last_err = LLMError(f"{model}: HTTP {resp.status_code}")
+                    if failures < max(1, self.cfg.llm_max_retries):
+                        await asyncio.sleep(_retry_after(resp) or 1.5 ** (failures - 1))
+                    continue
+                # Some providers call JSON mode a 'feature', not response_format.
+                body = resp.text.lower()
+                unsupported = any(word in body for word in ("response_format", "json", "does not support fea", "unsupported feature"))
+                if resp.status_code in (400, 422) and use_json and unsupported:
+                    use_json = False
+                    self._no_json_models.add(model)
+                    log.warning("LLM %s: JSON mode unsupported; retry without it", model)
+                    continue
                 if resp.status_code != 200:
-                    last_err = LLMError(f"chat/completions: {resp.status_code} {resp.text[:200]} ({_hint(resp.status_code)})")
+                    last_err = LLMError(f"{model}: HTTP {resp.status_code} ({_hint(resp.status_code)})")
+                    if resp.status_code == 401:
+                        raise last_err
                     break
-
-                def _parse_content(r) -> tuple[dict, dict, str | None]:
-                    try:
-                        d = r.json()
-                    except ValueError as e:
-                        raise LLMError(f"ответ не JSON: {r.text[:200]}") from e
-                    try:
-                        ch = d["choices"][0]
-                        cnt = (ch.get("message") or {}).get("content")
-                    except (KeyError, IndexError, TypeError) as e:
-                        raise LLMError(f"неожиданный формат ответа: {str(d)[:300]}") from e
-                    return d, ch, cnt
-
                 try:
-                    raw, choice, content = _parse_content(resp)
-                except LLMError as e:
-                    last_err = e
+                    raw = resp.json()
+                    choice = raw["choices"][0]
+                    content = (choice.get("message") or {}).get("content")
+                    reason = choice.get("finish_reason")
+                except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+                    last_err = LLMError(f"{model}: неверная структура ответа")
                     break
-
-                # пустой content + json_mode → ретрай без json_mode (poolside и т.д.)
-                if not content and "response_format" in payload:
-                    log.warning("Модель %s вернула пустой content c response_format=json_object — повтор без json-режима", model)
-                    self._no_json_mode = True
-                    payload.pop("response_format", None)
-                    await self._limiter.acquire()
-                    try:
-                        resp2 = await self._post("/chat/completions", payload)
-                    except LLMError as e:
-                        last_err = e
-                        break
-                    if resp2.status_code != 200:
-                        last_err = LLMError(f"chat/completions (retry): {resp2.status_code} {resp2.text[:200]} ({_hint(resp2.status_code)})")
-                        break
-                    try:
-                        raw, choice, content = _parse_content(resp2)
-                    except LLMError as e:
-                        last_err = e
-                        break
-
-                # если модель оборвала из-за лимита токенов — ретрай с увеличенным бюджетом
-                if choice.get("finish_reason") == "length":
-                    # reasoning-модели съели бюджет на размышления
-                    if max_tokens < 2048 and attempt < self.cfg.llm_max_retries - 1:
-                        new_tokens = min(2048, max_tokens * 2)
-                        log.warning("LLM %s оборвала ответ (finish_reason=length, max_tokens=%s) — ретрай с %s", model, max_tokens, new_tokens)
-                        max_tokens = new_tokens
-                        # не считаем это за фолбек модели, просто следующая попытка той же модели
-                        await asyncio.sleep(0.5 + attempt * 0.5)
+                # Check truncation BEFORE empty-content/JSON compatibility retries.
+                if reason == "length":
+                    last_err = LLMError(f"{model}: ответ обрезан, max_tokens={tokens}")
+                    if tokens < self.cfg.llm_max_tokens_limit:
+                        tokens = min(tokens * 2, self.cfg.llm_max_tokens_limit)
+                        log.warning("LLM %s: length, retry with %s tokens", model, tokens)
                         continue
-                    else:
-                        log.warning("LLM %s length-обрыв даже с %s токенов, пробую фолбек", model, max_tokens)
-                        last_err = LLMError(f"модель {model} оборвала ответ (finish_reason=length, max_tokens={max_tokens}). Сырой: {str(raw)[:400]}")
-                        break
-
-                if content:
-                    usage = raw.get("usage") or {}
-                    log.debug("LLM ok: model=%s (запрошена %s) prompt=%s completion=%s",
-                              raw.get("model"), model, usage.get("prompt_tokens"), usage.get("completion_tokens"))
-                    if raw.get("model") and raw.get("model") != model:
-                        log.info("LLM роутер %s → %s", model, raw.get("model"))
+                    break
+                if isinstance(content, str) and content.strip():
+                    log.info("LLM ok: requested=%s actual=%s tokens=%s", model, raw.get("model"), (raw.get("usage") or {}).get("completion_tokens"))
                     return content
-
-                err = raw.get("error") or choice.get("error")
-                last_err = LLMError(
-                    f"модель {model} вернула пустой content (finish_reason={choice.get('finish_reason')}, error={str(err)[:150]}). Сырой: {str(raw)[:400]}"
-                )
-                log.warning("LLM %s пустой ответ — пробую фолбек: %s", model, last_err)
-                break  # к следующей модели
-
-            if model != chain[-1]:
-                log.info("LLM фолбек: %s → %s (причина: %s)", model, chain[chain.index(model)+1], last_err)
-                continue
-        raise last_err or LLMError("все LLM-модели исчерпаны")
+                if use_json and not empty_retry:
+                    empty_retry = True
+                    use_json = False
+                    continue  # transient empty output does not poison capability cache
+                last_err = LLMError(f"{model}: пустой content, finish_reason={reason}")
+                break
+            log.warning("LLM fallback after %s: %s", model, last_err)
+        raise last_err
 
     async def _post(self, path: str, payload: dict[str, Any]) -> httpx.Response:
         try:

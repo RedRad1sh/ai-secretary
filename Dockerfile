@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 # ffmpeg — конвертация голосовых сообщений для ASR (на всякий случай)
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg tzdata \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg tzdata tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

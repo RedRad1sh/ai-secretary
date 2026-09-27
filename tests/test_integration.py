@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("BOT_TOKEN", "123456:TEST")
 os.environ.setdefault("ALLOWED_USER_ID", "555000111")
+os.environ.setdefault("PAID_USER_IDS", "555000111")
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="ai-secretary-test-"))
 
 from aiogram import Bot, Dispatcher  # noqa: E402
