@@ -161,6 +161,23 @@ class Database:
         await self.db.execute(
             "DELETE FROM reminders WHERE event_pk = ? AND sent = 0", (event_pk,)
         )
+        # Legacy: до фикса (issue #6) события создавали напоминания с
+        # event_pk=NULL — их отмена по pk не находила. Отменяем строку первого
+        # вхождения (сравнение в UTC: напоминания хранятся в UTC, событие —
+        # может с-offset). Повторяющиеся legacy-события: дальше первого
+        # вхождения строки не чистятся (остаток старых баз, документировано).
+        row = await self.get_event_by_pk(event_pk)
+        if row is not None and row["start_iso"]:
+            try:
+                start_utc = datetime.fromisoformat(
+                    row["start_iso"]).astimezone(timezone.utc).isoformat()
+            except ValueError:
+                start_utc = None
+            if start_utc:
+                await self.db.execute(
+                    "DELETE FROM reminders WHERE event_pk IS NULL AND sent = 0 "
+                    "AND start_iso = ?", (start_utc,),
+                )
         await self.db.commit()
 
     # ---- request log (ТЗ §3.3) ----

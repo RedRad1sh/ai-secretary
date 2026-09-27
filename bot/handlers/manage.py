@@ -147,6 +147,9 @@ async def on_manage_text(message: Message, state: FSMContext, cfg: Config, db) -
             text=f"«{r['title'][:40]}» — {_fmt(datetime.fromisoformat(r['start_iso']))}",
             callback_data=f"mg:pick:{r['id']}",
         )] for r in cands]
+        # Без set_state кнопка mg:pick молча не срабатывает: у cb_pick
+        # фильтр ManageStates.confirm (issue #6).
+        await state.set_state(ManageStates.confirm)
         await state.update_data(
             action=action, payload=payload,
             new_start=parsed_start.isoformat() if parsed_start else None,

@@ -271,10 +271,15 @@ async def on_state_other(message: Message) -> None:
 
 # ========================= НАПОМИНАНИЯ =========================
 
-async def _schedule_reminder(db, draft: EventDraft) -> None:
-    """Планирует Telegram-напоминание согласно настройкам (/settings → 🔔)."""
+async def _schedule_reminder(db, event_pk: int | None, draft: EventDraft) -> None:
+    """Планирует Telegram-напоминание согласно настройкам (/settings → 🔔).
+
+    event_pk обязателен: без него cancel_reminders_for_event(pk) при
+    отмене/переносе/undo не найдёт строки, и напоминание уйдёт на
+    удалённое событие (issue #6).
+    """
     minutes = reminder_minutes(await db.get_setting("reminders", "10"))
-    await schedule_for_event(db, None, draft, minutes)
+    await schedule_for_event(db, event_pk, draft, minutes)
 
 
 # ========================= INLINE-КНОПКИ =========================
@@ -329,13 +334,13 @@ async def cb_create(callback: CallbackQuery, state: FSMContext, cfg: Config, db,
                         f"⚠️ Google Calendar недоступен ({e}).\nДержите файл — импортируйте вручную:")
         return
 
-    await db.add_event(
+    pk = await db.add_event(
         calendar_id=calendar_id, event_id=event["id"], title=draft.title,
         start_iso=draft.start.isoformat() if draft.start else None,
         end_iso=draft.end.isoformat() if draft.end else None,
         rrule=draft.rrule, link=event.get("htmlLink"),
     )
-    await _schedule_reminder(db, draft)
+    await _schedule_reminder(db, pk, draft)
     await db.log_request("button", "created", draft.title)
     await state.clear()
     try:
@@ -356,13 +361,13 @@ async def _create_many(callback: CallbackQuery, state: FSMContext, cfg: Config, 
     if gcal is None:
         for d in drafts:
             content = build_ics(d, tz_name)
-            await db.add_event(
+            pk = await db.add_event(
                 calendar_id="ics", event_id=f"ics-{uuid.uuid4().hex[:8]}", title=d.title,
                 start_iso=d.start.isoformat() if d.start else None,
                 end_iso=d.end.isoformat() if d.end else None,
                 rrule=d.rrule, via_ics=True,
             )
-            await _schedule_reminder(db, d)
+            await _schedule_reminder(db, pk, d)
         await db.log_request("button", "ics_fallback_multi", f"{len(drafts)}")
         await state.clear()
         try:
@@ -389,25 +394,25 @@ async def _create_many(callback: CallbackQuery, state: FSMContext, cfg: Config, 
     for d in drafts:
         try:
             event = await gcal.create_event(d, calendar_id, tz_name)
-            await db.add_event(
+            pk = await db.add_event(
                 calendar_id=calendar_id, event_id=event["id"], title=d.title,
                 start_iso=d.start.isoformat() if d.start else None,
                 end_iso=d.end.isoformat() if d.end else None,
                 rrule=d.rrule, link=event.get("htmlLink"),
             )
-            await _schedule_reminder(db, d)
+            await _schedule_reminder(db, pk, d)
             created.append((d.title, event.get("htmlLink")))
         except GCalError as e:
             log.warning("GCal create failed for %s: %s", d.title, e)
             # фолбек в .ics для этого события
             content = build_ics(d, tz_name)
-            await db.add_event(
+            pk = await db.add_event(
                 calendar_id="ics", event_id=f"ics-{uuid.uuid4().hex[:8]}", title=d.title,
                 start_iso=d.start.isoformat() if d.start else None,
                 end_iso=d.end.isoformat() if d.end else None,
                 rrule=d.rrule, via_ics=True,
             )
-            await _schedule_reminder(db, d)
+            await _schedule_reminder(db, pk, d)
             created.append((d.title + " (.ics)", None))
     await db.log_request("button", "created_multi", f"{len(created)}")
     await state.clear()
@@ -428,13 +433,13 @@ async def _send_ics(callback: CallbackQuery, state: FSMContext, db, draft: Event
                     tz_name: str, preamble: str) -> None:
     """Fallback из ТЗ §8: .ics-файл + прямая ссылка на Google Календарь."""
     content = build_ics(draft, tz_name)
-    await db.add_event(
+    pk = await db.add_event(
         calendar_id="ics", event_id=f"ics-{uuid.uuid4().hex[:8]}", title=draft.title,
         start_iso=draft.start.isoformat() if draft.start else None,
         end_iso=draft.end.isoformat() if draft.end else None,
         rrule=draft.rrule, via_ics=True,
     )
-    await _schedule_reminder(db, draft)
+    await _schedule_reminder(db, pk, draft)
     await db.log_request("button", "ics_fallback", draft.title)
     await state.clear()
     try:
