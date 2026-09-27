@@ -1,5 +1,12 @@
 # 🤖 AI-секретарь — Telegram-бот с экспортом .ics
 
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![aiogram](https://img.shields.io/badge/aiogram-3.x-0088cc.svg)](https://docs.aiogram.dev/)
+[![Docker](https://img.shields.io/badge/docker-supported-2496ed.svg)](https://docs.docker.com/)
+[![Tests](https://img.shields.io/badge/tests-offline%2C%20no%20network-4caf50.svg)](#тесты)
+[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-ff69b4.svg)](LICENSE.md)
+[![Status](https://img.shields.io/badge/status-in%20development-yellow.svg)](docs/ROADMAP.md)
+
 Персональный Telegram-бот: принимает текст, голос и пересланные сообщения на русском языке,
 извлекает через любой OpenAI-совместимый AI-API (ProxyAPI, VseGPT, OpenRouter, OpenAI, Ollama… или нативный GigaChat) информацию о встречах/делах/напоминаниях и готовит файлы .ics для импорта в календарь. Автоматическая интеграция Google Calendar отложена.
 
@@ -161,5 +168,8 @@ Webhook-адаптер сохранён, но `/tmp` в YC Functions **не яв
 python tests/test_smoke.py
 python tests/test_integration.py
 python tests/test_multuser_security.py
+python tests/test_html_escaping.py
+python tests/test_parsing_ics.py
+python tests/test_stage3_reliability.py
 python -m unittest discover -s tests -p test_regressions.py
 ```
