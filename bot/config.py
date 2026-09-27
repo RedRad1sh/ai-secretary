@@ -50,6 +50,12 @@ class Config:
     llm_voice_model: str = "whisper-1"
     llm_stt_enabled: bool = True
     llm_json_mode: bool = True   # response_format=json_object; при отказе провайдера авто-отключается
+    # STT (голос) можно держать на отдельном провайдере, чем LLM: например
+    # LLM на free-моделях OpenRouter (аудио там только платное, минимум $0.50),
+    # а STT — на бесплатном Groq whisper. Пусто = фолбэк на значения LLM_* выше.
+    stt_api_url: str = ""
+    stt_api_key: str = ""
+    stt_model: str = ""
 
     # GigaChat (нативный, альтернатива)
     giga_api_key: str = ""
@@ -112,6 +118,9 @@ def load_config() -> Config:
         llm_voice_model=_get("LLM_VOICE_MODEL", "whisper-1"),
         llm_stt_enabled=_get("LLM_STT_ENABLED", "true").lower() != "false",
         llm_json_mode=_get("LLM_JSON_MODE", "true").lower() != "false",
+        stt_api_url=_get("STT_API_URL"),
+        stt_api_key=_get("STT_API_KEY"),
+        stt_model=_get("STT_MODEL"),
         giga_api_key=_get("GIGACHAT_API_KEY"),
         giga_scope=_get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS"),
         giga_model=_get("GIGACHAT_MODEL", "GigaChat"),

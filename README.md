@@ -78,6 +78,10 @@ python -m bot.main
    ProxyAPI и VseGPT — РФ и рубли; OpenRouter/OpenAI/DeepSeek; локальная Ollama —
    вообще без ключа). Проверка: `python scripts/test_llm.py`.
    Альтернатива — нативный GigaChat: ключ с [developers.sber.ru/gigachat](https://developers.sber.ru/gigachat).
+   **Голосовые** (STT) идут на тот же провайдер; если LLM — на бесплатных
+   моделях OpenRouter, а аудио там платное (402 при балансе < $0.50) —
+   отведите голос на бесплатный Groq: `STT_API_URL=https://api.groq.com/openai/v1`,
+   `STT_API_KEY=gsk_...`, `STT_MODEL=whisper-large-v3-turbo` (issue #12).
 4. Google OAuth на этом этапе не настраивайте: бот выдаёт .ics. Сохранённый код интеграции пока не используется обработчиками.
 
 ## Запуск на сервере (Docker)
