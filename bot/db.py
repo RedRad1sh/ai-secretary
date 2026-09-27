@@ -201,11 +201,19 @@ class Database:
         async with self.db.execute("SELECT * FROM events WHERE id = ?", (pk,)) as cur:
             return await cur.fetchone()
 
-    async def update_event_times(self, pk: int, start_iso: str, end_iso: str | None) -> None:
-        await self.db.execute(
-            "UPDATE events SET start_iso = ?, end_iso = ? WHERE id = ?",
-            (start_iso, end_iso, pk),
-        )
+    async def update_event_times(self, pk: int, start_iso: str, end_iso: str | None,
+                                 rrule: str | None = None,
+                                 set_rrule: bool = False) -> None:
+        if set_rrule:
+            await self.db.execute(
+                "UPDATE events SET start_iso = ?, end_iso = ?, rrule = ? WHERE id = ?",
+                (start_iso, end_iso, rrule, pk),
+            )
+        else:
+            await self.db.execute(
+                "UPDATE events SET start_iso = ?, end_iso = ? WHERE id = ?",
+                (start_iso, end_iso, pk),
+            )
         await self.db.commit()
 
     async def stats(self) -> dict:

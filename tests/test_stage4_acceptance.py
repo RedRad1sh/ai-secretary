@@ -78,6 +78,14 @@ def _friday_from_tomorrow() -> str:
     return (d + timedelta(days=(4 - d.weekday()) % 7)).strftime("%Y-%m-%d")
 
 
+MSK = ZoneInfo("Europe/Moscow")
+
+
+def _msk(start_iso: str) -> datetime:
+    """start_iso из БД (UTC) -> московское время для сравнения часа/дня."""
+    return datetime.fromisoformat(start_iso).astimezone(MSK)
+
+
 class FakeLLM:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -94,7 +102,7 @@ class FakeLLM:
                  "recurrence": None, "confidence": 0.95, "missing": []},
             ]}, ensure_ascii=False)
         if "пятниц" in user.lower():
-            return json.dumps({"is_event": True, "title": "Пятничный созвон",
+            return json.dumps({"is_event": True, "title": "Созвон команды",
                                "date": _friday_from_tomorrow(), "time": "18:30",
                                "duration_minutes": 60, "all_day": False,
                                "recurrence": {"freq": "WEEKLY", "byday": "FR"},
@@ -411,7 +419,7 @@ async def main() -> None:
         calls = await feed(_cbq(OWN, "ev:create"))
         ics_text = docs(calls)[0].document.data.decode("utf-8") if docs(calls) else ""
         evs = await db.all_events()
-        fr = [r for r in evs if r["title"] == "Пятничный созвон"]
+        fr = [r for r in evs if r["title"] == "Созвон команды"]
         check("C2b .ics повторяющегося события: RRULE FREQ=WEEKLY;BYDAY=FR",
               "RRULE:FREQ=WEEKLY" in ics_text and "BYDAY=FR" in ics_text
               and fr and fr[0]["rrule"], ics_text[:300])
@@ -479,6 +487,86 @@ async def main() -> None:
               and not any(datetime.fromisoformat(r["start_iso"]) == old_dt
                           and r["event_pk"] in (pk_p, None) for r in rem),
               str([(r["event_pk"], r["start_iso"], r["sent"]) for r in rem]))
+
+        # C4d: перенос ПОВТОРЯЮЩЕГОСЯ события (только время): RRULE жив,
+        # напоминания перепланированы на ВСЕ вхождения, а не на одно
+        evs = await db.all_events()
+        row_fr = [r for r in evs if r["id"] == pk_fr][0]
+        old_fr_start = row_fr["start_iso"]
+        calls = await feed(_msg(OWN, "перенеси созвон команды на 19:00"))
+        kb = next((c.reply_markup for c in reversed(calls)
+                   if c.__class__.__name__ == "SendMessage" and c.reply_markup),
+                  None)
+        pick = None
+        if kb:
+            for row_ in kb.inline_keyboard:
+                for b in row_:
+                    if (b.callback_data or "").startswith("mg:pick:") \
+                            and "Пятничный" in (b.text or ""):
+                        pick = b.callback_data
+        if pick:
+            calls = await feed(_cbq(OWN, pick))
+        check("C4d1 перенос повтора: подтверждение",
+              preview_kb(calls) == "mg:yes", str(texts(calls)))
+        await feed(_cbq(OWN, "mg:yes"))
+        evs = await db.all_events()
+        row_fr = [r for r in evs if r["id"] == pk_fr][0]
+        fr_new_start = datetime.fromisoformat(row_fr["start_iso"])
+        fr_old_start = datetime.fromisoformat(old_fr_start)
+        rem_fr_now = [r for r in await pending(db) if r["event_pk"] == pk_fr]
+        check("C4d2 перенос повтора: время обновлено, RRULE сохранён",
+              fr_new_start.date() == fr_old_start.date()
+              and (fr_new_start.hour, fr_new_start.minute) == (19, 0)
+              and row_fr["rrule"] == "FREQ=WEEKLY;BYDAY=FR",
+              f"{row_fr['start_iso']} rrule={row_fr['rrule']}")
+        # 8 напоминаний = 8 разных пятниц; у всех должно быть новое время 19:00
+        # (МСК), и ни одного старого (18:30) не должно остаться
+        all_new_time = len(rem_fr_now) >= 8 and all(
+            _msk(r["start_iso"]).strftime("%H:%M") == "19:00" for r in rem_fr_now)
+        no_old_left = not any(
+            _msk(r["start_iso"]).strftime("%H:%M") == "18:30"
+            and r["event_pk"] in (pk_fr, None) for r in await pending(db))
+        check("C4d3 перенос повтора: напоминания на все вхождения, старые сняты",
+              all_new_time and no_old_left,
+              str([(r["event_pk"], r["start_iso"]) for r in rem_fr_now]))
+
+        # C4e: перенос повтора на другой день недели — серия следует за датой
+        sat = TOMORROW + timedelta(days=(5 - TOMORROW.weekday()) % 7)
+        calls = await feed(_msg(
+            OWN, f"перенеси созвон команды на {sat.strftime('%d.%m')} в 18:30"))
+        kb = next((c.reply_markup for c in reversed(calls)
+                   if c.__class__.__name__ == "SendMessage" and c.reply_markup),
+                  None)
+        pick = None
+        if kb:
+            for row_ in kb.inline_keyboard:
+                for b in row_:
+                    if (b.callback_data or "").startswith("mg:pick:") \
+                            and "Пятничный" in (b.text or ""):
+                        pick = b.callback_data
+        if pick:
+            calls = await feed(_cbq(OWN, pick))
+        check("C4e1 перенос повтора на другую дату: подтверждение",
+              preview_kb(calls) == "mg:yes", str(texts(calls)))
+        await feed(_cbq(OWN, "mg:yes"))
+        evs = await db.all_events()
+        row_fr = [r for r in evs if r["id"] == pk_fr][0]
+        sat_dt = datetime(sat.year, sat.month, sat.day, 18, 30,
+                          tzinfo=ZoneInfo("Europe/Moscow"))
+        rem_fr_now = [r for r in await pending(db) if r["event_pk"] == pk_fr]
+        # серия перескочила на субботу: вхождение события = sat, RRULE BYDAY=SA,
+        # все напоминания — по субботам в 18:30
+        rem_saturdays = len(rem_fr_now) >= 1 and all(
+            _msk(r["start_iso"]).weekday() == 5
+            and _msk(r["start_iso"]).strftime("%H:%M") == "18:30"
+            for r in rem_fr_now)
+        check("C4e2 перенос повтора на субботу: событие, RRULE и напоминания "
+              "следуют за новой датой",
+              datetime.fromisoformat(row_fr["start_iso"]) == sat_dt
+              and row_fr["rrule"] == "FREQ=WEEKLY;BYDAY=SA"
+              and rem_saturdays,
+              f"start={row_fr['start_iso']} rrule={row_fr['rrule']} "
+              f"rem={[r['start_iso'] for r in rem_fr_now][:3]}")
 
         # C5: отмена текстом: событие deleted, напоминания отменены
         # (включая legacy-строки с event_pk=NULL от событий, созданных до фикса)
