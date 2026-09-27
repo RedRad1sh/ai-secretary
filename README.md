@@ -160,5 +160,6 @@ Webhook-адаптер сохранён, но `/tmp` в YC Functions **не яв
 ```bash
 python tests/test_smoke.py
 python tests/test_integration.py
+python tests/test_multuser_security.py
 python -m unittest discover -s tests -p test_regressions.py
 ```

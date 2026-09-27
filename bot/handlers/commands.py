@@ -162,9 +162,11 @@ async def _send_day(message: Message, db, cfg: Config, offset: int) -> None:
 
 
 @router.message(Command("stats"))
-async def cmd_stats(message: Message, db, cfg: Config) -> None:
+async def cmd_stats(message: Message, db) -> None:
     st = await db.stats()
-    size = cfg.db_path.stat().st_size / 1024 if cfg.db_path.exists() else 0
+    # Размер БД ТЕКУЩЕГО пользователя (у владельца это bot.db, у остальных
+    # users/<ID>.db) — cfg.db_path здесь нельзя: это база legacy-владельца.
+    size = db.path.stat().st_size / 1024 if db.path.exists() else 0
     up = int(time.time() - _START_TIME)
     giga_fails = st["reqlog"].get("failed", 0)
     created = st["reqlog"].get("created", 0)
