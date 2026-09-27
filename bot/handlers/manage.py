@@ -23,7 +23,7 @@ from aiogram.types import (
 )
 
 from bot.config import Config
-from bot.handlers.common import OwnerFilter, get_tz_name
+from bot.handlers.common import OwnerFilter, esc, get_tz_name
 from bot.models import EventDraft, get_tz
 from bot.reminders import reminder_minutes, schedule_for_event
 from bot.services.extractor import extract_event_local
@@ -166,12 +166,13 @@ async def _ask_confirm(message: Message, state: FSMContext, action: str, row,
     old_end = (datetime.fromisoformat(row["end_iso"])
                if row["end_iso"] else None)
 
+    title = esc(row["title"])  # заголовок — пользовательские данные
     if action == "cancel":
-        text = f"❓ Отменить «<b>{row['title']}</b>» ({_fmt(old_start)})?"
+        text = f"❓ Отменить «<b>{title}</b>» ({_fmt(old_start)})?"
         new_start_iso = None
     else:
         new_start, new_end = compose_move(old_start, old_end, parsed_start, payload)
-        text = (f"❓ Перенести «<b>{row['title']}</b>»:\n"
+        text = (f"❓ Перенести «<b>{title}</b>»:\n"
                 f"{_fmt(old_start)}  →  <b>{_fmt(new_start)}</b>?")
         new_start_iso = new_start.isoformat()
 
@@ -239,7 +240,7 @@ async def cb_yes(callback: CallbackQuery, state: FSMContext, cfg: Config, db,
         await db.log_request("manage", "cancelled", row["title"])
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.answer(
-            f"🗑 Отменил «{row['title']}» (и его напоминание)."
+            f"🗑 Отменил «{esc(row['title'])}» (и его напоминание)."
         )
         return
 
@@ -268,5 +269,5 @@ async def cb_yes(callback: CallbackQuery, state: FSMContext, cfg: Config, db,
     await db.log_request("manage", "moved", row["title"])
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
-        f"✅ Перенёс «{row['title']}» на {_fmt(new_start)}."
+        f"✅ Перенёс «{esc(row['title'])}» на {_fmt(new_start)}."
     )
