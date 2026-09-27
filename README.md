@@ -171,5 +171,6 @@ python tests/test_multuser_security.py
 python tests/test_html_escaping.py
 python tests/test_parsing_ics.py
 python tests/test_stage3_reliability.py
+python tests/test_stage4_acceptance.py   # OCR-часть: реальный tesseract, если он установлен
 python -m unittest discover -s tests -p test_regressions.py
 ```
