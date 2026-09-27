@@ -76,6 +76,9 @@ async def on_text(message: Message, state: FSMContext, cfg: Config, db,
 async def on_voice(message: Message, state: FSMContext, cfg: Config, db,
                    llm, bot) -> None:
     """Голосовое сообщение: транскрипция через GigaChat Whisper -> тот же пайплайн."""
+    if llm is None:
+        await message.answer("Распознавание голоса не настроено. Пришлите текст.")
+        return
     try:
         await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     except Exception:  # noqa: BLE001 — косметика
@@ -96,13 +99,34 @@ async def on_voice(message: Message, state: FSMContext, cfg: Config, db,
     await _process(note, state, cfg, db, llm, transcript, "voice")
 
 
-@router.message(F.photo | F.video | F.document)
+@router.message(F.photo)
+async def on_photo(message: Message, state: FSMContext, cfg: Config, db, llm, bot) -> None:
+    from bot.access import PAID_NOTICE
+    from bot.services.ocr import recognize_image
+    if not cfg.is_paid(message.from_user.id):
+        await message.answer(PAID_NOTICE)
+        return
+    photo = message.photo[-1]
+    if photo.file_size and photo.file_size > 5 * 1024 * 1024:
+        await message.answer("Изображение больше 5 МБ. Пришлите уменьшенное фото.")
+        return
+    try:
+        file = await bot.get_file(photo.file_id)
+        buf = await bot.download_file(file.file_path)
+        text = await recognize_image(buf.getvalue())
+    except (ValueError, TimeoutError) as e:
+        await message.answer("OCR недоступен или не смог прочитать фото. Пришлите текст.")
+        log.warning("OCR failed: %s", e)
+        return
+    if not text:
+        await message.answer("Текст на фото не найден. Пришлите более чёткое изображение.")
+        return
+    await _process(message, state, cfg, db, llm, text + "\n" + (message.caption or ""), "photo")
+
+
+@router.message(F.video | F.document)
 async def on_media(message: Message) -> None:
-    """ТЗ §2.2: изображения — опционально, на втором этапе."""
-    await message.answer(
-        "🖼 Распознавание картинок и файлов — на втором этапе. "
-        "А пока пришлите текст или голосовое 🎙"
-    )
+    await message.answer("Пришлите изображение как фото, либо описание события текстом.")
 
 
 # ========================= ЯДРО ПОТОКА =========================
@@ -113,6 +137,12 @@ async def _process(message: Message, state: FSMContext, cfg: Config, db,
         await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     except Exception:  # noqa: BLE001 — «печатает…» косметика, не должна ломать поток
         pass
+    if not cfg.is_paid(state.key.user_id):
+        import re
+        from bot.access import PAID_NOTICE
+        if re.search(r"кажд\w*|ежедневно|еженедельно|по будням|[;\n].*\d|,?\s+(?:а|и)\s+в\s+\d", text.lower()):
+            await message.answer(PAID_NOTICE + " Можно создать одно неповторяющееся событие.")
+            return
     tz_name = await get_tz_name(db, cfg)
     try:
         drafts = await extract_events(llm, text, tz_name)
@@ -129,6 +159,12 @@ async def _process(message: Message, state: FSMContext, cfg: Config, db,
             "например: «встреча с Иваном завтра в 15:00»."
         )
         await db.log_request(source, "no_event", text[:120])
+        return
+
+    if not cfg.is_paid(state.key.user_id) and (len(drafts) > 1 or any(d.recurrence for d in drafts)):
+        from bot.access import PAID_NOTICE
+        await state.clear()
+        await message.answer(PAID_NOTICE + " Можно создать одно неповторяющееся событие.")
         return
 
     if len(drafts) == 1:
@@ -176,7 +212,7 @@ async def _show_multi_preview(message: Message, state: FSMContext, drafts: list[
         titles = ", ".join(f"«{d.title}»" for d in need_date)
         await message.answer(
             f"Нашёл {len(drafts)} события, но у {titles} не понял дату.\n"
-            "❓ Напишите дату для них (например: «завтра» — применится ко всем без даты, или «первое завтра в 10:00, второе в 11:00»)."
+            "❓ Напишите дату для них (например: «завтра» — применится ко всем без даты, для разных дат нажмите ✏️ и пришлите полное исправленное описание)."
         )
         return
     await state.set_state(None)
@@ -207,11 +243,17 @@ async def on_clarify(message: Message, state: FSMContext, cfg: Config, db) -> No
         )
         await db.log_request("clarify", "retry", message.text[:120])
         return
-    draft.start = local.start
-    draft.end = local.end
-    draft.all_day = draft.all_day and local.all_day
-    draft.missing = [m for m in draft.missing if m not in ("date", "time")]
-    await _show_preview(message, state, draft, tz_name)
+    targets = data.get("drafts") or [draft]
+    for item in targets:
+        if item and item.needs_date:
+            item.start = local.start
+            item.end = local.end
+            item.all_day = item.all_day and local.all_day
+            item.missing = [m for m in item.missing if m not in ("date", "time")]
+    if data.get("drafts"):
+        await _show_multi_preview(message, state, targets, tz_name)
+    else:
+        await _show_preview(message, state, draft, tz_name)
 
 
 @router.message(ParseStates.waiting_edit, F.text)

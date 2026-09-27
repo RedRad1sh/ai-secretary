@@ -18,6 +18,22 @@ class Config:
     bot_token: str = ""
     allowed_user_id: int | None = None
 
+    allowed_user_ids: frozenset[int] = frozenset()
+    paid_user_ids: frozenset[int] = frozenset()
+    llm_total_timeout: float = 35.0
+    llm_max_tokens: int = 4096
+    llm_max_tokens_limit: int = 8192
+
+    def is_allowed(self, user_id: int) -> bool:
+        return user_id in self.allowed_user_ids or user_id == self.allowed_user_id
+
+    def is_paid(self, user_id: int) -> bool:
+        return self.is_allowed(user_id) and user_id in self.paid_user_ids
+
+    @property
+    def all_user_ids(self) -> frozenset[int]:
+        return self.allowed_user_ids | ({self.allowed_user_id} if self.allowed_user_id else set())
+
     # Пути
     data_dir: Path = field(default_factory=lambda: BASE_DIR / "data")
     db_path: Path = field(default_factory=lambda: BASE_DIR / "data" / "bot.db")
@@ -68,12 +84,25 @@ def _get(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def _ids(name: str) -> frozenset[int]:
+    import re
+    values = frozenset(int(v) for v in re.split(r"[,;\s]+", _get(name)) if v)
+    if any(v <= 0 for v in values):
+        raise ValueError(f"{name}: ожидаются положительные Telegram user ID")
+    return values
+
+
 def load_config() -> Config:
     load_dotenv(BASE_DIR / ".env")
 
     cfg = Config(
         bot_token=_get("BOT_TOKEN"),
         allowed_user_id=int(_get("ALLOWED_USER_ID")) if _get("ALLOWED_USER_ID") else None,
+        allowed_user_ids=_ids("ALLOWED_USER_IDS"),
+        paid_user_ids=_ids("PAID_USER_IDS"),
+        llm_total_timeout=float(_get("LLM_TOTAL_TIMEOUT", "35")),
+        llm_max_tokens=int(_get("LLM_MAX_TOKENS", "4096")),
+        llm_max_tokens_limit=int(_get("LLM_MAX_TOKENS_LIMIT", "8192")),
         llm_api_url=_get("LLM_API_URL"),
         llm_api_key=_get("LLM_API_KEY"),
         llm_model=_get("LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"),
@@ -93,6 +122,13 @@ def load_config() -> Config:
         default_calendar_id=_get("DEFAULT_CALENDAR_ID", "primary"),
         log_level=getattr(__import__("logging"), _get("LOG_LEVEL", "INFO").upper(), 20),
     )
+
+    if cfg.allowed_user_id is not None and cfg.allowed_user_id <= 0:
+        raise ValueError("ALLOWED_USER_ID должен быть положительным")
+    if not (0 < cfg.llm_total_timeout <= 300):
+        raise ValueError("LLM_TOTAL_TIMEOUT должен быть в диапазоне (0, 300]")
+    if not (0 < cfg.llm_max_tokens <= cfg.llm_max_tokens_limit <= 32768):
+        raise ValueError("Нужно 0 < LLM_MAX_TOKENS <= LLM_MAX_TOKENS_LIMIT <= 32768")
 
     data_dir = BASE_DIR / _get("DATA_DIR", "data")
     db_path = Path(_get("DB_PATH")) if _get("DB_PATH") else data_dir / "bot.db"

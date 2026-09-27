@@ -37,6 +37,7 @@ class EventDraft:
     confidence: float = 1.0
     missing: list[str] = field(default_factory=list)
     raw_text: str = ""
+    extraction_note: str = ""
 
     # ---------- построение из ответа AI ----------
 
@@ -63,12 +64,12 @@ class EventDraft:
         if start is not None:
             if data.get("end_time"):
                 end = _compose(data.get("date"), data.get("end_time"), tz, now)
-                if end and end <= start:
-                    end = None
+                if end and end < start:
+                    end += timedelta(days=1)
             if end is None and not all_day:
                 dur = data.get("duration_minutes")
                 duration = (
-                    timedelta(minutes=int(dur)) if _is_num(dur) and dur > 0 else DEFAULT_DURATION
+                    timedelta(minutes=int(float(dur))) if _is_num(dur) and float(dur) > 0 else DEFAULT_DURATION
                 )
                 end = start + duration
 
@@ -98,54 +99,17 @@ class EventDraft:
 
     # ---------- повторяющиеся события: ближайшие даты ----------
 
-    def next_occurrences(self, n: int = 8) -> list[datetime]:
-        """Следующие n вхождений повторяющегося события (для напоминаний)."""
-        if self.start is None or not self.recurrence:
+    def next_occurrences(self, n: int = 8, *, after: datetime | None = None,
+                         inclusive: bool = False) -> list[datetime]:
+        """RFC RRULE semantics, shared with ICS (invalid month days are skipped)."""
+        if self.start is None or not self.rrule:
             return []
-        freq = str(self.recurrence.get("freq", "WEEKLY")).lower()
-        interval = self.recurrence.get("interval")
-        step = int(interval) if _is_num(interval) and interval > 1 else 1
-        out: list[datetime] = []
-
-        if freq == "daily":
-            for i in range(1, n + 1):
-                out.append(self.start + timedelta(days=i * step))
-            return out
-
-        if freq == "weekly":
-            codes = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
-            byday = self.recurrence.get("byday")
-            want = ({d.strip().upper() for d in str(byday).split(",") if d.strip()}
-                    if byday else {codes[self.start.weekday()]})
-            base = self.start.date()
-            found = i = 0
-            while found < n and i < 400:  # страховка от бесконечного цикла
-                i += 1
-                d = base + timedelta(days=i)
-                if codes[d.weekday()] in want and (i // 7) % step == 0:
-                    out.append(datetime.combine(d, self.start.time(),
-                                                tzinfo=self.start.tzinfo))
-                    found += 1
-            return out
-
-        if freq == "monthly":
-            y, m = self.start.year, self.start.month
-            for i in range(1, n + 1):
-                mm = m + i * step
-                yy = y + (mm - 1) // 12
-                mm = (mm - 1) % 12 + 1
-                day = self.start.day
-                while day > 28:  # февраль и короткие месяцы
-                    try:
-                        out.append(self.start.replace(year=yy, month=mm, day=day))
-                        break
-                    except ValueError:
-                        day -= 1
-                else:
-                    out.append(self.start.replace(year=yy, month=mm, day=day))
-            return out
-
-        return out
+        from dateutil.rrule import rrulestr
+        try:
+            rule = rrulestr(self.rrule, dtstart=self.start)
+            return list(rule.xafter(after or self.start, count=n, inc=inclusive))
+        except (ValueError, TypeError, OverflowError):
+            return []
 
     # ---------- RRULE (повторяющиеся события, ТЗ §2.3) ----------
 
@@ -159,8 +123,8 @@ class EventDraft:
         if byday:
             parts.append(f"BYDAY={byday}")
         interval = self.recurrence.get("interval")
-        if _is_num(interval) and interval > 1:
-            parts.append(f"INTERVAL={int(interval)}")
+        if _is_num(interval) and float(interval) > 1:
+            parts.append(f"INTERVAL={int(float(interval))}")
         return ";".join(parts)
 
     @property
@@ -185,6 +149,8 @@ class EventDraft:
 
     def preview_text(self, tz_name: str) -> str:
         lines = [f"📌 <b>{_esc(self.title)}</b>"]
+        if self.extraction_note:
+            lines.append(f"⚠️ {_esc(self.extraction_note)}")
         if self.start:
             when = self.start.strftime("%d.%m.%Y")
             when += f" ({WEEKDAYS_RU_FULL[self.start.weekday()]})"

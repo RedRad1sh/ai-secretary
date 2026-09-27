@@ -16,7 +16,6 @@ from bot.config import get_config
 from bot.db import Database
 from bot.handlers import commands, manage, parse_flow
 from bot import reminders
-from bot.services.gcal import GCalClient
 from bot.services.llm import create_llm_client
 
 
@@ -61,6 +60,10 @@ def build_dispatcher(cfg, db, llm, gcal) -> "Dispatcher":
     dp["llm"] = llm
     dp["gcal"] = gcal
 
+    from bot.access import UserAccessMiddleware
+    dp.message.outer_middleware(UserAccessMiddleware())
+    dp.callback_query.outer_middleware(UserAccessMiddleware())
+
     dp.include_router(commands.router)
     dp.include_router(manage.router)
     dp.include_router(parse_flow.router)
@@ -76,8 +79,7 @@ async def main() -> None:
     await db.connect()
 
     llm = create_llm_client(cfg)
-    gcal = GCalClient(cfg.google_client_id, cfg.google_client_secret,
-                      cfg.google_refresh_token) if cfg.google_ready else None
+    gcal = None  # OAuth отложен: всем выдаём .ics
 
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = build_dispatcher(cfg, db, llm, gcal)
@@ -106,14 +108,14 @@ async def main() -> None:
     log.info("Бот запущен. AI: %s. Google Calendar: %s",
              type(llm).__name__ if llm else "не настроен (офлайн-парсер)",
              "подключён" if gcal else "НЕ настроен (режим .ics)")
-    if cfg.allowed_user_id is None:
-        log.warning("ALLOWED_USER_ID не задан — бот будет отвечать всем! Задайте его в .env")
+    if not cfg.all_user_ids:
+        log.warning("Whitelist пуст — доступ закрыт. Задайте ALLOWED_USER_IDS.")
 
     async def reminder_loop() -> None:
         """Каждые 30 секунд проверяет созревшие напоминания и шлёт их в Telegram."""
         while True:
             try:
-                await reminders.sweep(bot, db, cfg)
+                await reminders.sweep_all(bot, db, cfg)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — цикл не должен умирать
@@ -124,10 +126,14 @@ async def main() -> None:
     log.info("Планировщик напоминаний запущен (каждые 30 с)")
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         sweep_task.cancel()
+        try:
+            await sweep_task
+        except asyncio.CancelledError:
+            pass
         if llm is not None:
             await llm.close()
         await db.close()

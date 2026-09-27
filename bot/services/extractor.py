@@ -84,7 +84,7 @@ async def extract_events(
         d = extract_event_local(text, tz_name, now)
         return [d] if d else []
 
-    log.info("AI ответ: %.500r", answer)
+    log.debug("AI ответ: %.500r", answer)
     data = parse_ai_json(answer)
     if data is None:
         log.warning("AI вернул не-JSON (см. выше «AI ответ») — пробуем локальный парсер")
@@ -107,12 +107,6 @@ async def extract_events(
             if d is None:
                 continue
             d.raw_text = text
-            if d.needs_date:
-                # пробуем уточнить дату локально по куску
-                local = extract_event_local(item.get("title","") + " " + text, tz_name, now)
-                if local and local.start:
-                    d.start, d.end = local.start, local.end
-                    d.missing = [m for m in d.missing if m != "date"]
             if not d.title or d.title.lower() in ("событие", "event"):
                 d.title = (item.get("title") or text.strip().splitlines()[0])[:80]
             drafts.append(d)
@@ -135,12 +129,6 @@ async def extract_events(
             draft.missing = [m for m in draft.missing if m != "date"]
     if not draft.title or draft.title.lower() in ("событие", "event"):
         draft.title = (text.strip().splitlines() or ["Событие"])[0][:80]
-    # эвристика: если в тексте явно два времени, но LLM вернул одно — пробуем локально дополнить
-    if _count_times(text) >= 2:
-        local_list = extract_events_local(text, tz_name, now)
-        if len(local_list) >= 2:
-            log.info("Эвристика: в тексте %s времени, локально нашли %s событий — используем локальные", _count_times(text), len(local_list))
-            return local_list
     return [draft]
 
 
@@ -176,7 +164,16 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
     }
 
     candidates: list[datetime] = []
+    if local_recurrence(text) and re.search(r"\bв\s+\d{1,2}(?::\d{2})?\b", text):
+        candidates.append(now.replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0))
     explicit_dates: set = set()
+
+    time_range = _TIME_RANGE.search(text)
+    if time_range and (int(time_range[1]) > 23 or int(time_range[3]) > 23 or int(time_range[2] or 0) > 59 or int(time_range[4] or 0) > 59):
+        return None
+    parse_text = text
+    if time_range:
+        parse_text = text[:time_range.start()] + " в " + time_range.group(1) + ":" + (time_range.group(2) or "00") + text[time_range.end():]
 
     # 1) Явные даты в тексте («29.09.2026», «15.10 в 18:30») — высший приоритет
     for m in re.finditer(
@@ -187,14 +184,14 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
             candidates.append(naive)
             explicit_dates.add(naive.date())
 
-    naive = dateparser.parse(text, languages=["ru"], settings=settings)
+    naive = dateparser.parse(parse_text, languages=["ru"], settings=settings)
     if naive:
         candidates.append(naive)
 
     try:
         from dateparser.search import search_dates
 
-        found = search_dates(text, languages=["ru"], settings=settings) or []
+        found = search_dates(parse_text, languages=["ru"], settings=settings) or []
         candidates += [dt for _, dt in found]
     except Exception:  # noqa: BLE001 — search_dates иногда падает на экзотике
         pass
@@ -202,7 +199,7 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
     try:
         from rutimeparser import parse as ru_parse
 
-        ru_dt = ru_parse(text, now=now.replace(tzinfo=None))
+        ru_dt = ru_parse(parse_text, now=now.replace(tzinfo=None))
         if ru_dt:
             candidates.append(ru_dt)
     except Exception:  # noqa: BLE001 — rutimeparser опционален
@@ -242,13 +239,39 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
     start = min(future, key=lambda d: (not (d.hour or d.minute),
                                        abs((d - now).total_seconds())))
 
-    has_time = bool(start.hour or start.minute) or _has_explicit_time(text)
+    # Explicit relative day outranks stray time-only candidates from search_dates.
+    relative = re.search(r"\b(послезавтра|завтра|сегодня)\b", text.lower())
+    if relative and not explicit_dates:
+        day = now + timedelta(days={"сегодня": 0, "завтра": 1, "послезавтра": 2}[relative[1]])
+        start = start.replace(year=day.year, month=day.month, day=day.day)
+    clock = re.search(r"\b(?:в|с)\s+(\d{1,2})(?::(\d{2}))?\b", parse_text)
+    if clock and int(clock[1]) < 24 and int(clock[2] or 0) < 60:
+        start = start.replace(hour=int(clock[1]), minute=int(clock[2] or 0), second=0, microsecond=0)
+    has_time = bool(clock) or _has_explicit_time(text)
+    recurrence = local_recurrence(text)
+    if recurrence:
+        probe = EventDraft(title="Событие", start=start, recurrence=recurrence)
+        occurrences = probe.next_occurrences(1, after=now, inclusive=True)
+        if occurrences:
+            start = occurrences[0]
+    end = start + timedelta(minutes=60) if has_time else None
+    duration = re.search(r"\bна\s+(\d+)\s*(минут\w*|час\w*)", text.lower())
+    if duration and has_time:
+        end = start + timedelta(minutes=int(duration[1]) * (60 if duration[2].startswith("час") else 1))
+    if time_range:
+        start = start.replace(hour=int(time_range[1]), minute=int(time_range[2] or 0))
+        end = start.replace(hour=int(time_range[3]), minute=int(time_range[4] or 0))
+        if end <= start:
+            end += timedelta(days=1)
+
     start = _fix_morning_evening(start, text)
     first_sentence = re.split(r"(?<!\d)[.!?](?!\d)|\n", text.strip())[0].strip()
     return EventDraft(
         title=(first_sentence or "Событие")[:80],
         start=start,
-        end=start + timedelta(minutes=60) if has_time else None,
+        end=end,
+        recurrence=recurrence,
+        extraction_note="Локальный разбор: проверьте даты, длительность и повтор. Сложные условия повторов могут быть не распознаны.",
         all_day=not has_time,
         confidence=0.5,
         missing=[] if has_time else ["time"],
@@ -258,49 +281,41 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
 
 def extract_events_local(text: str, tz_name: str, now: datetime | None = None) -> list:
     """Пытается вырезать несколько событий из одного сообщения офлайн."""
-    # разбиваем по предложениям/союзам, сохраняя исходный текст для каждого куска
-    parts = re.split(r"[\n;]+|\s+\.\s+|\s*\n\s*", text)
-    # также режем по " На 10:00" " в 10:00" если есть два времени
-    expanded = []
-    for part in parts:
-        # если в куске два времени типа "в 11:00 ... На 10:00" — режем по " На "
-        sub = re.split(r"\s+(?:На\s+|на\s+|и\s+в\s+|\s+а\s+в\s+)", part)
-        expanded.extend(sub)
-    # fallback: если разбиение дало 1 часть но в тексте 2 времени — режем по времени
-    if len(expanded) == 1 and _count_times(text) >= 2:
-        # найдём второе время и разрежем
-        times = list(re.finditer(r"\b\d{1,2}[:.]\d{2}\b", text))
-        if len(times) >= 2:
-            mid = times[1].start()
-            # ищем ближайшую границу предложения до второго времени
-            cut = text.rfind(".", 0, mid)
-            if cut == -1:
-                cut = text.rfind(" ", 0, mid-10)
-            if cut != -1 and cut < mid:
-                expanded = [text[:cut+1].strip(), text[cut+1:].strip()]
-
+    # Split only explicit event boundaries, never a second clock in a range.
+    parts = re.split(r"[\n;]+|,?\s+(?:а|и)\s+(?=в\s+\d)", text)
     drafts = []
-    seen_starts = set()
-    for chunk in expanded:
-        chunk = chunk.strip()
-        if not chunk or len(chunk) < 5:
+    shared_day = re.search(r"\b(послезавтра|завтра|сегодня)\b", parts[0].lower())
+    for chunk in parts:
+        if not chunk.strip():
             continue
-        # эвристика: в куске должно быть время или слово "завтра/сегодня"
-        if not (_has_explicit_time(chunk) or any(w in chunk.lower() for w in ["завтра","сегодня","послезавтра","вчера","понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"])):
-            continue
-        d = extract_event_local(chunk, tz_name, now)
-        if d and d.start and d.start.isoformat() not in seen_starts:
-            # уточняем title: берём первые слова куска
-            first = re.split(r"(?<!\d)[.!?](?!\d)|\n", chunk)[0].strip()[:80]
-            if first and d.title.lower() in ("событие","event") or len(d.title) < 5:
-                d.title = first
-            seen_starts.add(d.start.isoformat())
-            drafts.append(d)
-    # если нашли >=2 — сортируем по времени
-    if len(drafts) >= 2:
-        drafts.sort(key=lambda x: x.start)
-        return drafts
+        if shared_day and not re.search(r"завтра|сегодня|\d{1,2}[./]\d{1,2}|понедель|вторник|сред|четверг|пятниц|суббот|воскрес", chunk.lower()):
+            chunk = shared_day[1] + " " + chunk
+        draft = extract_event_local(chunk, tz_name, now)
+        if draft:
+            drafts.append(draft)
     return drafts
+
+
+_TIME_RANGE = re.compile(r"\bс\s+(\d{1,2})(?::(\d{2}))?\s*(?:до|[-–—])\s*(\d{1,2})(?::(\d{2}))?\b", re.I)
+
+
+def local_recurrence(text: str) -> dict | None:
+    text = text.lower()
+    if re.search(r"каждый день|ежедневно", text):
+        return {"freq": "DAILY"}
+    if "по будням" in text:
+        return {"freq": "WEEKLY", "byday": "MO,TU,WE,TH,FR"}
+    if re.search(r"кажд\w*|еженедельно|\bпо\b", text):
+        days = [("понедель", "MO"), ("вторник", "TU"), ("сред", "WE"),
+                ("четверг", "TH"), ("пятниц", "FR"), ("суббот", "SA"), ("воскрес", "SU")]
+        codes = [code for name, code in days if name in text]
+        if codes:
+            return {"freq": "WEEKLY", "byday": ",".join(codes)}
+        if "каждую неделю" in text or "еженедельно" in text:
+            return {"freq": "WEEKLY"}
+        if "каждый месяц" in text:
+            return {"freq": "MONTHLY"}
+    return None
 
 
 def _count_times(text: str) -> int:
