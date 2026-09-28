@@ -201,13 +201,17 @@ class OpenAICompatClient:
     async def transcribe(self, audio: bytes, filename: str = "voice.ogg") -> str:
         if not self.cfg.llm_stt_enabled:
             raise LLMError("распознавание речи отключено (LLM_STT_ENABLED=false)")
+        # STT может жить на отдельном провайдере, чем LLM (STT_API_*),
+        # с фолбэком на LLM_API_URL/LLM_API_KEY/LLM_VOICE_MODEL по каждой позиции.
+        base = (self.cfg.stt_api_url or self.cfg.llm_api_url).rstrip("/")
+        key = self.cfg.stt_api_key or self.cfg.llm_api_key
+        model = self.cfg.stt_model or self.cfg.llm_voice_model
         try:
             resp = await self._http.post(
-                f"{self.base}/audio/transcriptions",
-                headers={"Authorization": self._headers.get("Authorization", "")}
-                if self.cfg.llm_api_key else {},
+                f"{base}/audio/transcriptions",
+                headers={"Authorization": f"Bearer {key}"} if key else {},
                 files={"file": (filename, audio, "audio/ogg")},
-                data={"model": self.cfg.llm_voice_model},
+                data={"model": model},
             )
         except httpx.HTTPError as e:
             raise LLMError(f"сеть: {e}") from e
@@ -215,7 +219,14 @@ class OpenAICompatClient:
         if resp.status_code in (404, 422):
             raise LLMError(
                 "провайдер не поддерживает audio/transcriptions — отключите голосовой "
-                "ввод (LLM_STT_ENABLED=false) или задайте LLM_VOICE_MODEL"
+                "ввод (LLM_STT_ENABLED=false) или задайте LLM_VOICE_MODEL / STT_*"
+            )
+        if resp.status_code == 402:
+            raise LLMError(
+                f"audio/transcriptions: 402 — у провайдера нет баланса на аудио "
+                f"({resp.text[:120]}). Варианты: пополнить баланс ИЛИ отвести голос "
+                f"на бесплатного провайдера: STT_API_URL / STT_API_KEY / STT_MODEL "
+                f"(напр. Groq: https://api.groq.com/openai/v1 + whisper-large-v3-turbo)"
             )
         if resp.status_code != 200:
             raise LLMError(
@@ -246,7 +257,8 @@ def _retry_after(resp: httpx.Response) -> float | None:
 
 def _hint(status: int) -> str:
     return {
-        401: "неверный LLM_API_KEY",
+        401: "неверный LLM_API_KEY (для голоса — STT_API_KEY)",
+        402: "недостаточно баланса у провайдера",
         403: "нет доступа к модели LLM_MODEL",
         404: "проверьте LLM_API_URL (обычно заканчивается на /v1) и LLM_MODEL",
         429: "лимит провайдера — подождите",

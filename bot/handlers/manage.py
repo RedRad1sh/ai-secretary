@@ -23,8 +23,8 @@ from aiogram.types import (
 )
 
 from bot.config import Config
-from bot.handlers.common import OwnerFilter, get_tz_name
-from bot.models import EventDraft, get_tz
+from bot.handlers.common import OwnerFilter, esc, get_tz_name
+from bot.models import EventDraft, RRULE_WEEKDAYS, get_tz, rrule_to_recurrence
 from bot.reminders import reminder_minutes, schedule_for_event
 from bot.services.extractor import extract_event_local
 from bot.services.gcal import GCalClient, GCalError
@@ -147,6 +147,9 @@ async def on_manage_text(message: Message, state: FSMContext, cfg: Config, db) -
             text=f"«{r['title'][:40]}» — {_fmt(datetime.fromisoformat(r['start_iso']))}",
             callback_data=f"mg:pick:{r['id']}",
         )] for r in cands]
+        # Без set_state кнопка mg:pick молча не срабатывает: у cb_pick
+        # фильтр ManageStates.confirm (issue #6).
+        await state.set_state(ManageStates.confirm)
         await state.update_data(
             action=action, payload=payload,
             new_start=parsed_start.isoformat() if parsed_start else None,
@@ -166,12 +169,13 @@ async def _ask_confirm(message: Message, state: FSMContext, action: str, row,
     old_end = (datetime.fromisoformat(row["end_iso"])
                if row["end_iso"] else None)
 
+    title = esc(row["title"])  # заголовок — пользовательские данные
     if action == "cancel":
-        text = f"❓ Отменить «<b>{row['title']}</b>» ({_fmt(old_start)})?"
+        text = f"❓ Отменить «<b>{title}</b>» ({_fmt(old_start)})?"
         new_start_iso = None
     else:
         new_start, new_end = compose_move(old_start, old_end, parsed_start, payload)
-        text = (f"❓ Перенести «<b>{row['title']}</b>»:\n"
+        text = (f"❓ Перенести «<b>{title}</b>»:\n"
                 f"{_fmt(old_start)}  →  <b>{_fmt(new_start)}</b>?")
         new_start_iso = new_start.isoformat()
 
@@ -239,7 +243,7 @@ async def cb_yes(callback: CallbackQuery, state: FSMContext, cfg: Config, db,
         await db.log_request("manage", "cancelled", row["title"])
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.answer(
-            f"🗑 Отменил «{row['title']}» (и его напоминание)."
+            f"🗑 Отменил «{esc(row['title'])}» (и его напоминание)."
         )
         return
 
@@ -253,6 +257,19 @@ async def cb_yes(callback: CallbackQuery, state: FSMContext, cfg: Config, db,
     duration = (old_end - old_start) if old_end and old_end > old_start else timedelta(minutes=60)
     new_end = new_start + duration
 
+    # Повторяющееся событие: серия переякоривается к новой дате (freq сохраняется;
+    # у weekly BYDAY обновляется под новый день недели). Иначе напоминания
+    # закладывались бы только на одно вхождение (issue #6).
+    recurrence = rrule_to_recurrence(row["rrule"])
+    new_rrule: str | None = None
+    if recurrence:
+        if str(recurrence.get("freq", "")).upper() == "WEEKLY" and recurrence.get("byday"):
+            recurrence = {**recurrence, "byday": RRULE_WEEKDAYS[new_start.weekday()]}
+        moved = EventDraft(title=row["title"], start=new_start, recurrence=recurrence)
+        new_rrule = moved.rrule
+    else:
+        moved = EventDraft(title=row["title"], start=new_start)
+
     if gcal is not None and row["calendar_id"] != "ics":
         try:
             await gcal.update_event_times(row["calendar_id"], row["event_id"],
@@ -261,12 +278,13 @@ async def cb_yes(callback: CallbackQuery, state: FSMContext, cfg: Config, db,
             await callback.message.answer(f"⚠️ Не удалось перенести в календаре: {e}")
             return
 
-    await db.update_event_times(pk, new_start.isoformat(), new_end.isoformat())
+    await db.update_event_times(pk, new_start.isoformat(), new_end.isoformat(),
+                                rrule=new_rrule, set_rrule=new_rrule is not None)
     await db.cancel_reminders_for_event(pk)
     minutes = reminder_minutes(await db.get_setting("reminders", "10"))
-    await schedule_for_event(db, pk, EventDraft(title=row["title"], start=new_start), minutes)
+    await schedule_for_event(db, pk, moved, minutes)
     await db.log_request("manage", "moved", row["title"])
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
-        f"✅ Перенёс «{row['title']}» на {_fmt(new_start)}."
+        f"✅ Перенёс «{esc(row['title'])}» на {_fmt(new_start)}."
     )

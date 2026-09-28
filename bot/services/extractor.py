@@ -176,6 +176,7 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
         parse_text = text[:time_range.start()] + " в " + time_range.group(1) + ":" + (time_range.group(2) or "00") + text[time_range.end():]
 
     # 1) Явные даты в тексте («29.09.2026», «15.10 в 18:30») — высший приоритет
+    has_clock = bool(re.search(r"\b[вс]\s*\d{1,2}[:.]\d{2}\b", text.lower()))
     for m in re.finditer(
         r"\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?(?:\s*в\s*\d{1,2}[:.]\d{2})?", text
     ):
@@ -183,6 +184,24 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
         if naive:
             candidates.append(naive)
             explicit_dates.add(naive.date())
+        # dateparser читает «dd.mm» как время (03:10), а «dd.mm в HH:MM» — как
+        # None. Ручной разбор: dd.mm[.гггг] — дата, если год явный либо рядом
+        # есть отдельное время («перенеси приём на 01.10 в 9:00»).
+        date_part = m.group(0).split()[0]
+        parts = re.split(r"[./]", date_part)
+        if 2 <= len(parts) <= 3:
+            try:
+                day, month = int(parts[0]), int(parts[1])
+                year = int(parts[2]) if len(parts) == 3 else now.year
+                if 1 <= day <= 31 and 1 <= month <= 12 and (len(parts) == 3 or has_clock):
+                    explicit = datetime(year, month, day)
+                    # Неявный год: прошедшая дата — вероятно, следующий год
+                    if len(parts) == 2 and explicit <= now.replace(tzinfo=None) - timedelta(days=1):
+                        explicit = explicit.replace(year=year + 1)
+                    candidates.append(explicit)
+                    explicit_dates.add(explicit.date())
+            except ValueError:
+                pass
 
     naive = dateparser.parse(parse_text, languages=["ru"], settings=settings)
     if naive:

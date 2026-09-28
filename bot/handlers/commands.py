@@ -19,7 +19,7 @@ from aiogram.types import (
 )
 
 from bot.config import Config
-from bot.handlers.common import OwnerFilter, get_calendar_id, get_tz_name
+from bot.handlers.common import OwnerFilter, esc, get_calendar_id, get_tz_name
 from bot.models import WEEKDAYS_RU_FULL, get_tz
 from bot.services.gcal import GCalClient, GCalError
 
@@ -82,9 +82,9 @@ async def cmd_list(message: Message, db) -> None:
     lines = ["🗓 <b>Последние события:</b>\n"]
     for i, r in enumerate(rows, 1):
         when = (r["start_iso"] or "?").replace("T", " ")[:16]
-        title = r["title"]
+        title = esc(r["title"])  # заголовок — пользовательские данные
         if r["link"]:
-            lines.append(f"{i}. <a href=\"{r['link']}\">{title}</a> — {when}")
+            lines.append(f"{i}. <a href=\"{esc(r['link'])}\">{title}</a> — {when}")
         elif r["via_ics"]:
             lines.append(f"{i}. {title} — {when} <i>(.ics)</i>")
         else:
@@ -162,9 +162,11 @@ async def _send_day(message: Message, db, cfg: Config, offset: int) -> None:
 
 
 @router.message(Command("stats"))
-async def cmd_stats(message: Message, db, cfg: Config) -> None:
+async def cmd_stats(message: Message, db) -> None:
     st = await db.stats()
-    size = cfg.db_path.stat().st_size / 1024 if cfg.db_path.exists() else 0
+    # Размер БД ТЕКУЩЕГО пользователя (у владельца это bot.db, у остальных
+    # users/<ID>.db) — cfg.db_path здесь нельзя: это база legacy-владельца.
+    size = db.path.stat().st_size / 1024 if db.path.exists() else 0
     up = int(time.time() - _START_TIME)
     giga_fails = st["reqlog"].get("failed", 0)
     created = st["reqlog"].get("created", 0)
@@ -188,7 +190,7 @@ async def cmd_undo(message: Message, db, gcal: GCalClient | None) -> None:
     if row["via_ics"]:
         await db.mark_deleted(row["id"])
         await message.answer(
-            f"«{row['title']}» убрано из истории. Файл .ics уже был отправлен — "
+            f"«{esc(row['title'])}» убрано из истории. Файл .ics уже был отправлен — "
             "если вы успели его импортировать, удалите событие в календаре вручную."
         )
         return
@@ -203,7 +205,9 @@ async def cmd_undo(message: Message, db, gcal: GCalClient | None) -> None:
     await db.mark_deleted(row["id"])
     await db.cancel_reminders_for_event(row["id"])
     await db.log_request("command", "undone", row["title"])
-    await message.answer(f"🗑 Удалил «{row['title']}» из календаря (и его напоминание).")
+    await message.answer(
+        f"🗑 Удалил «{esc(row['title'])}» из календаря (и его напоминание)."
+    )
 
 
 @router.message(Command("settings"))
@@ -241,8 +245,16 @@ async def cb_tz_menu(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("st:tzset:"))
 async def cb_tz_set(callback: CallbackQuery, db) -> None:
     tz = callback.data.split(":", 2)[2]
+    # Данные callback подделываемы: валидируем имя таймзоны ДО сохранения,
+    # иначе в настройках (и в HTML-ответе) окажется произвольная строка.
+    try:
+        ZoneInfo(tz)
+    except Exception:  # noqa: BLE001
+        await callback.message.edit_text("Не знаю такую таймзону. Пример: <code>Europe/Moscow</code>")
+        await callback.answer("Не сохранено", show_alert=True)
+        return
     await db.set_setting("timezone", tz)
-    await callback.message.edit_text(f"✅ Часовой пояс: <b>{tz}</b>")
+    await callback.message.edit_text(f"✅ Часовой пояс: <b>{esc(tz)}</b>")
     await callback.answer("Сохранено")
 
 
@@ -265,7 +277,7 @@ async def msg_tz(message: Message, db, state: FSMContext) -> None:
         return
     await db.set_setting("timezone", name)
     await state.clear()
-    await message.answer(f"✅ Часовой пояс: <b>{name}</b>")
+    await message.answer(f"✅ Часовой пояс: <b>{esc(name)}</b>")
 
 
 @router.callback_query(F.data == "st:cal")
@@ -286,7 +298,7 @@ async def msg_cal(message: Message, db, state: FSMContext) -> None:
     value = (message.text or "").strip() or "primary"
     await db.set_setting("calendar_id", value)
     await state.clear()
-    await message.answer(f"✅ События будут создаваться в <b>{value}</b>")
+    await message.answer(f"✅ События будут создаваться в <b>{esc(value)}</b>")
 
 
 @router.callback_query(F.data == "st:remind")
@@ -312,9 +324,18 @@ def _remind_label(v: str) -> str:
     return "выкл" if v == "off" else f"за {v} минут"
 
 
+_REMIND_VALUES = ("10", "30", "60", "off")
+
+
 @router.callback_query(F.data.startswith("st:remset:"))
 async def cb_remind_set(callback: CallbackQuery, db) -> None:
     value = callback.data.split(":", 2)[2]
+    # Данные callback подделываемы: принимаем только известные значения,
+    # иначе в настройках окажется произвольная строка (и разметка в ответе).
+    if value not in _REMIND_VALUES:
+        await callback.message.edit_text("Неизвестный интервал напоминаний.")
+        await callback.answer("Не сохранено", show_alert=True)
+        return
     await db.set_setting("reminders", value)
     await callback.message.edit_text(f"🔔 Напоминания: <b>{_remind_label(value)}</b>")
     await callback.answer("Сохранено")

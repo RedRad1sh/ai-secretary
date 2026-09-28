@@ -1,5 +1,12 @@
 # 🤖 AI-секретарь — Telegram-бот с экспортом .ics
 
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![aiogram](https://img.shields.io/badge/aiogram-3.x-0088cc.svg)](https://docs.aiogram.dev/)
+[![Docker](https://img.shields.io/badge/docker-supported-2496ed.svg)](https://docs.docker.com/)
+[![Tests](https://img.shields.io/badge/tests-offline%2C%20no%20network-4caf50.svg)](#тесты)
+[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-ff69b4.svg)](LICENSE.md)
+[![Status](https://img.shields.io/badge/status-in%20development-yellow.svg)](docs/ROADMAP.md)
+
 Персональный Telegram-бот: принимает текст, голос и пересланные сообщения на русском языке,
 извлекает через любой OpenAI-совместимый AI-API (ProxyAPI, VseGPT, OpenRouter, OpenAI, Ollama… или нативный GigaChat) информацию о встречах/делах/напоминаниях и готовит файлы .ics для импорта в календарь. Автоматическая интеграция Google Calendar отложена.
 
@@ -71,6 +78,10 @@ python -m bot.main
    ProxyAPI и VseGPT — РФ и рубли; OpenRouter/OpenAI/DeepSeek; локальная Ollama —
    вообще без ключа). Проверка: `python scripts/test_llm.py`.
    Альтернатива — нативный GigaChat: ключ с [developers.sber.ru/gigachat](https://developers.sber.ru/gigachat).
+   **Голосовые** (STT) идут на тот же провайдер; если LLM — на бесплатных
+   моделях OpenRouter, а аудио там платное (402 при балансе < $0.50) —
+   отведите голос на бесплатный Groq: `STT_API_URL=https://api.groq.com/openai/v1`,
+   `STT_API_KEY=gsk_...`, `STT_MODEL=whisper-large-v3-turbo` (issue #12).
 4. Google OAuth на этом этапе не настраивайте: бот выдаёт .ics. Сохранённый код интеграции пока не используется обработчиками.
 
 ## Запуск на сервере (Docker)
@@ -160,5 +171,10 @@ Webhook-адаптер сохранён, но `/tmp` в YC Functions **не яв
 ```bash
 python tests/test_smoke.py
 python tests/test_integration.py
+python tests/test_multuser_security.py
+python tests/test_html_escaping.py
+python tests/test_parsing_ics.py
+python tests/test_stage3_reliability.py
+python tests/test_stage4_acceptance.py   # OCR-часть: реальный tesseract, если он установлен
 python -m unittest discover -s tests -p test_regressions.py
 ```

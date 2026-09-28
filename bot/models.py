@@ -24,6 +24,37 @@ MAX_FUTURE_DAYS = 365 * 3
 
 WEEKDAYS_RU_FULL = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
+# порядковые коды дней недели для RRULE BYDAY (MO..SU), индекс = weekday()
+RRULE_WEEKDAYS = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+
+
+def rrule_to_recurrence(rrule: str | None) -> dict | None:
+    """Разбор RRULE обратно в recurrence-dict (обратная операция к EventDraft.rrule).
+
+    'FREQ=WEEKLY;BYDAY=FR;INTERVAL=2' -> {"freq": "WEEKLY", "byday": "FR", "interval": 2}
+    Нужен, чтобы при переносе повторяющегося события перечислить напоминания
+    на вхождения, а не на одно (issue #6).
+    """
+    if not rrule:
+        return None
+    rec: dict = {}
+    for part in rrule.split(";"):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip().upper()
+        v = v.strip()
+        if k == "FREQ":
+            rec["freq"] = v
+        elif k == "BYDAY":
+            rec["byday"] = v
+        elif k == "INTERVAL":
+            try:
+                rec["interval"] = int(v)
+            except ValueError:
+                pass
+    return rec or None
+
 @dataclass
 class EventDraft:
     title: str

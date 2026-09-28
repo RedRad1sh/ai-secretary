@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import html
+
 from aiogram.filters import BaseFilter
 from aiogram.types import TelegramObject
 
 from bot.config import Config
+
+
+def esc(value: object) -> str:
+    """Экранирует строку для Telegram HTML (parse_mode=HTML).
+
+    Пользовательские строки (заголовки событий из текста/LLM/OCR, транскрипты,
+    данные callback) не должны попадать в HTML в сыром виде: несбалансированные
+    теги ломают парсинг (400 Bad Request), валидные — дают сам-XSS.
+    """
+    return html.escape(str(value if value is not None else ""))
 
 
 class OwnerFilter(BaseFilter):
