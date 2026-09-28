@@ -55,11 +55,20 @@ ai-secretary-bot/
 ├── scripts/
 │   ├── gcal_auth.py         # одноразовый OAuth-скрипт → refresh-токен
 │   ├── set_webhook.py       # установка webhook (для serverless/VPS)
+│   ├── migrate.py           # идемпотентные миграции БД (шаг деплоя на VPS)
 │   └── build_yc_zip.py      # сборка yc-function.zip для Yandex Cloud Functions
 ├── serverless/
 │   └── yandex_handler.py    # адаптер Yandex Cloud Functions (хостинг за 0 ₽)
+├── deploy/
+│   ├── bootstrap.sh         # первичная настройка VPS (пакеты, venv, systemd, sudo)
+│   ├── remote-deploy.sh     # pull → зависимости → миграции → рестарт → проверка
+│   ├── ai-secretary.service # шаблон systemd-юнита
+│   └── sudoers-ai-secretary # минимум sudo-прав для деплоя
+├── migrations/              # SQL-миграции (применяются на деплое)
+├── .github/workflows/deploy.yml  # ручной деплой на VPS из GitHub Actions
 ├── docs/
 │   ├── HOSTING.md           # обзор дешёвых/бесплатных хостингов
+│   ├── DEPLOY_VPS.md        # деплой на свой VPS: systemd + GitHub Actions
 │   ├── DEPLOY_YC.md         # пошаговый деплой на Yandex Cloud Functions
 │   └── SETUP_GOOGLE.md      # пошаговая настройка Google Cloud OAuth
 ├── tests/test_smoke.py      # офлайн-тесты (даты, RRULE, .ics)
@@ -101,6 +110,27 @@ docker compose logs -f
 
 Бот работает 24/7, `restart: unless-stopped` переживает перезагрузки. Все файлы (БД, ключи, логи) — в `./data`.
 
+## Деплой на свой VPS без Docker (systemd + GitHub Actions)
+
+Тот же VPS можно вести и без Docker: бот живёт как systemd-юнит (~60–90 МБ RSS),
+а деплой запускается кнопкой в GitHub Actions — pull кода, зависимости, миграции,
+рестарт и проверка «Бот запущен» с автоматическим откатом при падении.
+
+```bash
+# один раз на сервере (Ubuntu): пакеты, код, venv, .env, systemd-юнит, sudo-правила
+bash deploy/bootstrap.sh
+# дальше — из репозитория: Actions → «Deploy to VPS» → Run workflow (ref: master)
+```
+
+Секреты репозитория: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`; необязательные
+переменные: `VPS_PORT`, `VPS_APP_DIR`, `VPS_SERVICE`. Деплой можно запустить и
+руками с сервера: `cd /opt/ai-secretary && bash deploy/remote-deploy.sh`.
+Миграции схемы — `migrations/*.sql`, применяет `scripts/migrate.py` (см.
+[migrations/README.md](migrations/README.md)).
+
+Полный гайд, разбор ошибок и вариант для нескольких приложений на одном VPS —
+[docs/DEPLOY_VPS.md](docs/DEPLOY_VPS.md).
+
 ## Yandex Cloud Functions — бесплатный вариант (0 ₽/мес)
 
 Вместо VDS бот можно развернуть как serverless-функцию с webhook: 1 000 000 вызовов и 10 GB×час в месяц — бесплатно,
@@ -141,6 +171,7 @@ python tests/test_stage3_reliability.py  # надёжность 24/7 (issue #5)
 python tests/test_stage4_acceptance.py   # OCR/сценарии (issue #6; A8/A9 — реальный tesseract)
 python tests/test_stt_endpoint.py        # голос: отдельный STT-эндпоинт (issue #12)
 python tests/test_planned_requests.py    # плановые запросы: допущения, серии (issue #13)
+python tests/test_migrations.py          # миграции БД: идемпотентность, откат, dry-run
 python -m unittest discover -s tests -p 'test_regressions.py'
 ```
 
@@ -164,7 +195,8 @@ python -m unittest discover -s tests -p 'test_regressions.py'
 `/today`, `/tomorrow`, управление текстом, OCR, `/stats`.
 Платёжного провайдера, подписок и автоматических списаний пока нет.
 
-Для 24/7 выбран Docker/VDS с постоянным `./data`, **один экземпляр polling**.
+Для 24/7 выбран Docker/VDS с постоянным `./data`, **один экземпляр polling**
+(вариант без Docker — systemd-юнит + деплой из GitHub Actions: [docs/DEPLOY_VPS.md](docs/DEPLOY_VPS.md)).
 OCR в Docker установлен; при локальном запуске нужны `tesseract-ocr`,
 `tesseract-ocr-rus`, `tesseract-ocr-eng`. Фото ≤5 МБ, OCR ограничен 20 секундами.
 Текст с фото всегда проходит подтверждение; PDF и видео не распознаются.
