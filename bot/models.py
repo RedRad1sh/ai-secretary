@@ -24,6 +24,16 @@ MAX_FUTURE_DAYS = 365 * 3
 
 WEEKDAYS_RU_FULL = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
+
+def plural_ru(n: int, one: str, few: str, many: str) -> str:
+    """Русская плюрализация: 1 событие / 2 события / 5 событий / 21 событие."""
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
 # порядковые коды дней недели для RRULE BYDAY (MO..SU), индекс = weekday()
 RRULE_WEEKDAYS = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
 
@@ -69,6 +79,9 @@ class EventDraft:
     missing: list[str] = field(default_factory=list)
     raw_text: str = ""
     extraction_note: str = ""
+    # допущения, которые модель/код сделали ЗА пользователя (issue #13):
+    # каждое маркируется в предпросмотре, тихих дефолтов нет
+    assumptions: list[str] = field(default_factory=list)
 
     # ---------- построение из ответа AI ----------
 
@@ -92,17 +105,37 @@ class EventDraft:
 
         end = None
         all_day = bool(data.get("all_day")) and data.get("time") is None
+        assumptions = _assumptions_from(data.get("assumptions"))
         if start is not None:
+            # «без тихих дефолтов» (issue #13): время не указано -> явный дефолт
+            # с обязательной пометкой допущения
+            time_defaulted = data.get("time") is None and not all_day
+            if time_defaulted:
+                start = start.replace(
+                    hour=DEFAULT_TIME.hour, minute=DEFAULT_TIME.minute,
+                    second=0, microsecond=0,
+                )
             if data.get("end_time"):
                 end = _compose(data.get("date"), data.get("end_time"), tz, now)
                 if end and end < start:
                     end += timedelta(days=1)
+            duration_defaulted = False
             if end is None and not all_day:
                 dur = data.get("duration_minutes")
+                duration_defaulted = not (_is_num(dur) and float(dur) > 0)
                 duration = (
-                    timedelta(minutes=int(float(dur))) if _is_num(dur) and float(dur) > 0 else DEFAULT_DURATION
+                    timedelta(minutes=int(float(dur))) if not duration_defaulted else DEFAULT_DURATION
                 )
                 end = start + duration
+            if time_defaulted:
+                span = f"{start:%H:%M}–{end:%H:%M}" if end else f"{start:%H:%M}"
+                assumptions.append(f"время не было указано — поставил дефолт {span}")
+            if duration_defaulted:
+                mins = int(duration.total_seconds() // 60)
+                assumptions.append(
+                    f"длительность не была указана — поставил дефолт "
+                    f"{mins} {plural_ru(mins, 'минута', 'минуты', 'минут')}"
+                )
 
         rec = data.get("recurrence")
         recurrence = rec if isinstance(rec, dict) and rec.get("freq") else None
@@ -120,6 +153,7 @@ class EventDraft:
             confidence=float(conf) if _is_num(conf) else 0.8,
             missing=missing,
             raw_text=str(data.get("raw_text") or ""),
+            assumptions=assumptions,
         )
 
     # ---------- запросы к пользователю ----------
@@ -194,6 +228,8 @@ class EventDraft:
             lines.append(f"📅 {when} <i>({tz_name})</i>")
         else:
             lines.append("📅 <i>дата не определена</i>")
+        for a in self.assumptions:
+            lines.append(f"⚠️ {_esc(a)}")
         if self.recurrence_human:
             lines.append(f"🔁 {_esc(self.recurrence_human)}")
         if self.location:
@@ -211,11 +247,105 @@ def _esc(s: str) -> str:
     )
 
 
+# ==================== предпросмотр серий событий (issue #13) ====================
+
+
+def _series_key(d: EventDraft) -> tuple[str, str]:
+    """Похожие события = одинаковые заголовок и описание («N одинаковых»)."""
+    return (
+        (d.title or "").strip().casefold(),
+        (d.description or "").strip().casefold(),
+    )
+
+
+def _is_series_group(group: list[EventDraft]) -> bool:
+    """Серия: ≥3 похожих событий с датами и без RRULE (иначе — обычные карточки)."""
+    return (
+        len(group) >= 3
+        and all(d.start for d in group)
+        and all(not d.recurrence for d in group)
+    )
+
+
+def _series_times(group: list[EventDraft]) -> str:
+    labels: list[str] = []
+    for d in group:
+        if d.all_day or d.start is None:
+            label = "весь день"
+        elif d.end:
+            label = f"{d.start:%H:%M}–{d.end:%H:%M}"
+        else:
+            label = f"{d.start:%H:%M}"
+        if label not in labels:
+            labels.append(label)
+    return ", ".join(labels)
+
+
+def series_preview_text(group: list[EventDraft], tz_name: str) -> str:
+    """Компактный блок серии: «период | время | описание | N событий + флаги».
+
+    Вместо N карточек — один блок; допущения (флаги) объединяются без повторов.
+    """
+    n = len(group)
+    starts = sorted(d.start for d in group if d.start)
+    first, last = starts[0], starts[-1]
+    period = (
+        first.strftime("%d.%m.%Y") if first.date() == last.date()
+        else f"{first.strftime('%d.%m.%Y')}–{last.strftime('%d.%m.%Y')}"
+    )
+    desc = group[0].description or group[0].title
+    flags: list[str] = []
+    for d in group:
+        for a in d.assumptions:
+            if a not in flags:
+                flags.append(a)
+    lines = [f"<b>📦 {_esc(group[0].title)}</b>"]
+    lines.append(
+        f"📅 {period} | ⏰ {_series_times(group)} | 📝 {_esc(desc)} | "
+        f"{n} {plural_ru(n, 'событие', 'события', 'событий')} <i>({tz_name})</i>"
+    )
+    lines += [f"⚠️ {_esc(a)}" for a in flags]
+    return "\n".join(lines)
+
+
+def multi_preview_text(drafts: list[EventDraft], tz_name: str) -> str:
+    """Предпросмотр пакета: серии (≥3 похожих) — компактными блоками, остальное — карточками."""
+    groups: dict[tuple[str, str], list[EventDraft]] = {}
+    for d in drafts:
+        groups.setdefault(_series_key(d), []).append(d)
+    parts: list[str] = []
+    idx = 1
+    for group in groups.values():
+        if _is_series_group(group):
+            parts.append(series_preview_text(group, tz_name))
+        else:
+            for d in group:
+                parts.append(f"<b>{idx}. {_esc(d.title)}</b>\n" + d.preview_text(tz_name))
+                idx += 1
+    return "\n\n---\n\n".join(parts)
+
+
 def _clean(value: object) -> str | None:
     if value is None:
         return None
     s = str(value).strip()
     return s or None
+
+
+def _assumptions_from(value: object) -> list[str]:
+    """Допущения из AI-JSON: список строк (или одна строка); не больше 10 штук."""
+    if isinstance(value, str):
+        items: list[object] = [value]
+    elif isinstance(value, list):
+        items = list(value)
+    else:
+        items = []
+    out = []
+    for v in items:
+        s = str(v).strip()
+        if s:
+            out.append(s[:300])
+    return out[:10]
 
 
 def _is_num(v: object) -> bool:
