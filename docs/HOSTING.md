@@ -71,6 +71,9 @@ docker compose up -d --build
 # автозапуск при ребуте уже даёт restart: unless-stopped
 ```
 
+Без Docker (systemd + venv, деплой из GitHub Actions, несколько приложений на
+одном VPS) — готовый скрипт и гайд: [DEPLOY_VPS.md](DEPLOY_VPS.md).
+
 Задержки: ДЦ в Москве → ~1–2 мс до Telegram-серверов, ~40–60 мс до Google/GigaChat. Ответ бота в лимит 5 с из ТЗ укладывается с запасом.
 
 ## Источники

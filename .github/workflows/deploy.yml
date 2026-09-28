@@ -1,0 +1,70 @@
+name: Deploy to VPS
+
+# Ручной деплой (без автозапуска по push):
+#   GitHub → Actions → «Deploy to VPS» → Run workflow.
+# Как настроить сервер и секреты — docs/DEPLOY_VPS.md.
+#
+# Автодеплой при push (если понадобится) — просто добавьте триггер:
+#   on:
+#     push:
+#       branches: [master]
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ветка / тег / коммит для деплоя"
+        required: true
+        default: master
+        type: string
+      restart_only:
+        description: "Только перезапустить сервис (без git pull и установки зависимостей)"
+        required: false
+        default: false
+        type: boolean
+
+# Два деплоя одновременно — это два git checkout и два рестарта в одном каталоге.
+concurrency:
+  group: deploy-ai-secretary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Pull + restart on VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Проверить входные данные
+        env:
+          REF_INPUT: ${{ inputs.ref }}
+        run: |
+          # Значение подставляется в удалённую команду, поэтому фильтруем символы.
+          if [[ ! "$REF_INPUT" =~ ^[A-Za-z0-9._/@-]{1,120}$ ]]; then
+            echo "::error::Недопустимый ref: '$REF_INPUT'. Разрешены буквы, цифры, . _ / @ -"
+            exit 1
+          fi
+          echo "Деплоим: $REF_INPUT (restart_only=${{ inputs.restart_only }})"
+
+      - name: Деплой по SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          # Необязательные настройки: Repository → Settings → Secrets and variables → Variables
+          port: ${{ vars.VPS_PORT || 22 }}
+          command_timeout: 20m
+          # Вся логика лежит в репозитории (deploy/remote-deploy.sh): её видно в git,
+          # и тот же скрипт можно запустить руками с сервера. Здесь — одна строка
+          # с переменными-префиксом, чтобы не зависеть от того, как экшен
+          # передаёт многострочные скрипты на удалённую сторону.
+          script: >-
+            APP_DIR="${{ vars.VPS_APP_DIR || '/opt/ai-secretary' }}" SERVICE="${{ vars.VPS_SERVICE || 'ai-secretary' }}"
+            REF="${{ inputs.ref }}" RESTART_ONLY="${{ inputs.restart_only }}"
+            bash -c '[[ -d "$APP_DIR/.git" ]] || { echo "❌ $APP_DIR: нет git-репозитория — первичная установка: docs/DEPLOY_VPS.md (bash deploy/bootstrap.sh)"; exit 1; };
+            cd "$APP_DIR";
+            [[ -f deploy/remote-deploy.sh ]] || { echo "❌ В $APP_DIR нет deploy/remote-deploy.sh: код на сервере старее этого файла. Обновите его (git fetch --force origin && git checkout --force --detach origin/master) или прогоните deploy/bootstrap.sh заново"; exit 1; };
+            exec bash deploy/remote-deploy.sh "$1" "$2"' _ "$REF" "$RESTART_ONLY"
