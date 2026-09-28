@@ -37,13 +37,14 @@ PROMPT = """Ты — модуль извлечения событий для к�
   "description": "str" | null,
   "recurrence": {{"freq": "DAILY"|"WEEKLY"|"MONTHLY", "byday": "MO,TU,WE,TH,FR,SA,SU", "interval": int}} | null,
   "confidence": 0.0,
-  "missing": ["date"|"time"|"title"]
+  "missing": ["date"|"time"|"title"],
+  "assumptions": ["str"]
 }}
 
 ЕСЛИ В ТЕКСТЕ НЕСКОЛЬКО СОБЫТИЙ (например: «завтра в 11:00 дейлик, а в 10:00 подготовка») — верни:
 {{
   "events": [
-    {{"title": "str", "date": "YYYY-MM-DD", "time": "HH:MM", "end_time": null, "duration_minutes": null, "all_day": false, "location": null, "participants": null, "description": null, "recurrence": null, "confidence": 0.9, "missing": []}},
+    {{"title": "str", "date": "YYYY-MM-DD", "time": "HH:MM", "end_time": null, "duration_minutes": null, "all_day": false, "location": null, "participants": null, "description": null, "recurrence": null, "confidence": 0.9, "missing": [], "assumptions": []}},
     {{"title": "str", "date": "YYYY-MM-DD", "time": "HH:MM", ...}}
   ]
 }}
@@ -52,7 +53,13 @@ PROMPT = """Ты — модуль извлечения событий для к�
 - Если это не событие/дело/напоминание — верни {{"is_event": false}}.
 - Для каждого события вычисли дату/время отдельно (завтра = {tomorrow}).
 - Не выдумывай дату: если не можешь определить — null и добавь в missing.
-- Пример одного: «встреча с Иваном завтра в 15:00 в кафе Пушкин» -> {{"is_event": true, "title": "Встреча с Иваном", "date": "{tomorrow}", "time": "15:00", "end_time": null, "duration_minutes": null, "all_day": false, "location": "кафе Пушкин", "participants": "Иван", "description": null, "recurrence": null, "confidence": 0.95, "missing": []}}"""
+- assumptions — список допущений, которые ты сделал ЗА пользователя (пустой, если всё взято из текста). См. «ПЛАНОВЫЕ ЗАПРОСЫ».
+
+ПЛАНОВЫЕ ЗАПРОСЫ (серии похожих событий: «план/программа на неделю», «создай N событий», «распиши тренировки»):
+- Количество и содержание событий бери СТРОГО из запроса пользователя: «12 событий» — ровно 12, «всю неделю» — все 7 дней. Не сокращай серию, не расширяй, не придумывай содержание программ (ты секретарь, а не тренер/диетолог).
+- НЕ выдумывай время, длительность и раскладку (утро/вечер, какие дни): если пользователь не указал — верни time/end_time/duration_minutes = null и добавь "time" в missing; система подставит дефолт и пометит его сама.
+- Если ты всё же подбираешь параметр за пользователя (время, длительность, дни недели, раскол утро/вечер, исключённые дни) — перечисли КАЖДОЕ такое допущение в поле assumptions у соответствующего события, например: «время не было указано — поставил дефолт 08:00–09:00», «раскладка утро/вечер — моё допущение», «взял 6 дней: Пн–Сб, воскресенье исключил по допущению». Никаких тихих дефолтов: секретарь говорит «я предположил», а не молчит.
+- Пример одного: «встреча с Иваном завтра в 15:00 в кафе Пушкин» -> {{"is_event": true, "title": "Встреча с Иваном", "date": "{tomorrow}", "time": "15:00", "end_time": null, "duration_minutes": null, "all_day": false, "location": "кафе Пушкин", "participants": "Иван", "description": null, "recurrence": null, "confidence": 0.95, "missing": [], "assumptions": []}}"""
 
 
 async def extract_events(
@@ -112,6 +119,7 @@ async def extract_events(
             drafts.append(d)
         if drafts:
             log.info("AI извлёк %s событий: %s", len(drafts), ", ".join(f"«{x.title}»" for x in drafts))
+            _mark_assumed_time(drafts, text)
             return drafts
         # если events пустой — считаем не событием
         return []
@@ -129,6 +137,7 @@ async def extract_events(
             draft.missing = [m for m in draft.missing if m != "date"]
     if not draft.title or draft.title.lower() in ("событие", "event"):
         draft.title = (text.strip().splitlines() or ["Событие"])[0][:80]
+    _mark_assumed_time([draft], text)
     return [draft]
 
 
@@ -349,6 +358,34 @@ def _has_explicit_time(text: str) -> bool:
         re.search(r"\b\d{1,2}[:.]\d{2}\b", text)
         or re.search(r"\b\d{1,2}\s*(?:утра|дня|вечера|ночи|час(?:а|ов)?)\b", text)
     )
+
+
+_TIME_MENTION = re.compile(
+    r"\b\d{1,2}[:.]\d{2}\b"                              # 15:00, 9.30
+    r"|\b\d{1,2}\s*(?:утра|дня|вечера|ночи|час(?:а|ов)?)\b"  # «в 3 дня», «5 часов»
+    r"|\b(?:в|с|до|к)\s+\d{1,2}(?::\d{2})?\b",           # «в 15», «с 9 до 10»
+    re.I,
+)
+
+
+def _user_specified_time(text: str) -> bool:
+    """Есть ли во всём запросе хоть одно упоминание конкретного времени."""
+    return bool(_TIME_MENTION.search(text or ""))
+
+
+def _mark_assumed_time(drafts, text: str) -> None:
+    """«Без тихих дефолтов» (issue #13): если во всём запросе не было ни одного
+    времени — любое время в извлечённых событиях это допущение (модели или
+    дефолт системы). Помечаем его явно, если модель не пометила сама."""
+    if _user_specified_time(text):
+        return
+    for d in drafts:
+        if d.start is None or d.all_day:
+            continue
+        if any("время не было указано" in a for a in d.assumptions):
+            continue  # уже помечено (кодом или моделью)
+        span = f"{d.start:%H:%M}–{d.end:%H:%M}" if d.end else f"{d.start:%H:%M}"
+        d.assumptions.append(f"время не было указано — поставил дефолт {span}")
 
 
 def _fix_morning_evening(start: datetime, text: str) -> datetime:

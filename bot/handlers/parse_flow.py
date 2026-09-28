@@ -23,7 +23,7 @@ from aiogram.types import (
 
 from bot.config import Config
 from bot.handlers.common import OwnerFilter, esc, get_calendar_id, get_tz_name
-from bot.models import EventDraft
+from bot.models import EventDraft, multi_preview_text, plural_ru
 from bot.reminders import reminder_minutes, schedule_for_event
 from bot.services.extractor import extract_event, extract_event_local, extract_events, extract_events_local
 from bot.services.gcal import GCalClient, GCalError
@@ -211,18 +211,18 @@ async def _show_multi_preview(message: Message, state: FSMContext, drafts: list[
         await state.update_data(drafts=drafts, tz_name=tz_name, draft=None)
         titles = ", ".join(f"«{d.title}»" for d in need_date)
         await message.answer(
-            f"Нашёл {len(drafts)} события, но у {titles} не понял дату.\n"
+            f"Нашёл {len(drafts)} {plural_ru(len(drafts), 'событие', 'события', 'событий')}, "
+            f"но у {titles} не понял дату.\n"
             "❓ Напишите дату для них (например: «завтра» — применится ко всем без даты, для разных дат нажмите ✏️ и пришлите полное исправленное описание)."
         )
         return
     await state.set_state(None)
     await state.update_data(drafts=drafts, draft=None, tz_name=tz_name)
-    blocks = []
-    for i, d in enumerate(drafts, 1):
-        blocks.append(f"<b>{i}. {esc(d.title)}</b>\n" + d.preview_text(tz_name))
-    txt = "\n\n---\n\n".join(blocks)
+    # серии (≥3 похожих) показываем компактным блоком, остальное — карточками (issue #13)
+    txt = multi_preview_text(drafts, tz_name)
     await message.answer(
-        f"Нашёл {len(drafts)} события:\n\n" + txt + "\n\n<i>Создать все?</i>",
+        f"Нашёл {len(drafts)} {plural_ru(len(drafts), 'событие', 'события', 'событий')}:\n\n"
+        + txt + "\n\n<i>Создать все?</i>",
         reply_markup=_multi_kb(len(drafts)),
     )
 

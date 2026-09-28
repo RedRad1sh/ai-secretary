@@ -28,6 +28,12 @@
 спрашивает уточнение, если дата не распознана, поддерживает повторяющиеся события (RRULE),
 часовые пояса, fallback-экспорт **.ics**-файла, если Google Calendar недоступен/не настроен.
 
+Плановые запросы («план/программу на неделю, N событий»): бот не выдумывает
+время/раскладку молча — любой дефолт (время, длительность, дни) помечается явно
+(«⚠️ время не было указано — поставил дефолт 08:00–09:00»), а серии от 3 похожих
+событий показываются одним компактным блоком «период | время | описание | N событий»
+с кнопкой «Создать все?».
+
 ## Структура проекта
 
 ```
@@ -126,7 +132,16 @@ docker compose logs -f
 ## Тесты
 
 ```bash
-python tests/test_smoke.py   # офлайн: нормализация дат, RRULE, .ics, парсинг JSON
+python tests/test_smoke.py               # офлайн: нормализация дат, RRULE, .ics, парсинг JSON
+python tests/test_integration.py         # интеграционный пайплайн
+python tests/test_multuser_security.py   # изоляция пользователей
+python tests/test_html_escaping.py       # экранирование HTML (issue #8)
+python tests/test_parsing_ics.py         # парсинг/диапазоны/повторы/.ics (issue #4)
+python tests/test_stage3_reliability.py  # надёжность 24/7 (issue #5)
+python tests/test_stage4_acceptance.py   # OCR/сценарии (issue #6; A8/A9 — реальный tesseract)
+python tests/test_stt_endpoint.py        # голос: отдельный STT-эндпоинт (issue #12)
+python tests/test_planned_requests.py    # плановые запросы: допущения, серии (issue #13)
+python -m unittest discover -s tests -p 'test_regressions.py'
 ```
 
 ## Ориентировочный бюджет
