@@ -13,7 +13,7 @@ Google Календаре (обходит .ics целиком).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
@@ -104,9 +104,12 @@ def build_ics(draft: EventDraft, tz_name: str = "Europe/Moscow") -> bytes:
     ]
 
     if draft.all_day:
+        # draft.end — последний день события включительно; в RFC 5545/all-day
+        # DTEND эксклюзивен, поэтому +1 день (иначе «отпуск с 5 по 10 октября»
+        # импортируется как 5–9 октября, а однодневное событие — как нулевое).
         lines.append(f"DTSTART;VALUE=DATE:{draft.start.strftime('%Y%m%d')}")
-        end_date = (draft.end or draft.start).strftime("%Y%m%d")
-        lines.append(f"DTEND;VALUE=DATE:{end_date}")
+        last_day = (draft.end or draft.start).date()
+        lines.append(f"DTEND;VALUE=DATE:{(last_day + timedelta(days=1)).strftime('%Y%m%d')}")
     else:
         lines.append(f"DTSTART;TZID={tz_name}:{_fmt_local(draft.start)}")
         lines.append(f"DTEND;TZID={tz_name}:{_fmt_local(draft.end or draft.start)}")
@@ -139,7 +142,9 @@ def build_gcal_link(draft: EventDraft) -> str | None:
     params: dict[str, str] = {"text": draft.title, "action": "TEMPLATE"}
     if draft.all_day:
         s = draft.start.strftime("%Y%m%d")
-        params["dates"] = f"{s}/{(draft.end or draft.start).strftime('%Y%m%d')}"
+        # Google принимает для all-day эксклюзивную дату окончания: +1 день
+        e = ((draft.end or draft.start).date() + timedelta(days=1)).strftime("%Y%m%d")
+        params["dates"] = f"{s}/{e}"
     else:
         end = draft.end or draft.start
         params["dates"] = "/".join(

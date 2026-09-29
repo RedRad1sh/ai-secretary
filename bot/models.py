@@ -17,6 +17,12 @@ WEEKDAYS_RU = {
     "FR": "пятница", "SA": "суббота", "SU": "воскресенье",
 }
 
+# дательный падеж множественного числа: «по средам и пятницам»
+WEEKDAYS_RU_DATIVE = {
+    "MO": "понедельникам", "TU": "вторникам", "WE": "средам", "TH": "четвергам",
+    "FR": "пятницам", "SA": "субботам", "SU": "воскресеньям",
+}
+
 DEFAULT_TIME = time(10, 0)          # если время не указано — 10:00
 DEFAULT_DURATION = timedelta(minutes=60)
 MAX_FUTURE_DAYS = 365 * 3
@@ -36,6 +42,111 @@ def plural_ru(n: int, one: str, few: str, many: str) -> str:
 
 # порядковые коды дней недели для RRULE BYDAY (MO..SU), индекс = weekday()
 RRULE_WEEKDAYS = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+
+
+def recurrence_rrule(recurrence: dict | None) -> str | None:
+    """RRULE-строка из recurrence-dict (единая точка для .ics, GCal и напоминаний)."""
+    if not recurrence:
+        return None
+    freq = str(recurrence.get("freq") or "WEEKLY").upper()
+    if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
+        freq = "WEEKLY"
+    parts = [f"FREQ={freq}"]
+    codes = recurrence_byday(recurrence)
+    if codes:
+        parts.append("BYDAY=" + ",".join(codes))
+    interval = recurrence.get("interval")
+    if _is_num(interval) and float(interval) > 1:
+        parts.append(f"INTERVAL={int(float(interval))}")
+    return ";".join(parts)
+
+
+def recurrence_byday(recurrence: dict | None) -> list[str]:
+    """Список валидных кодов дней недели из recurrence (['WE', 'FR'])."""
+    if not recurrence:
+        return []
+    raw = recurrence.get("byday")
+    if not raw:
+        return []
+    return [
+        c.strip().upper()
+        for c in str(raw).replace(";", ",").split(",")
+        if c.strip().upper() in RRULE_WEEKDAYS
+    ]
+
+
+def first_series_occurrence(start: datetime, recurrence: dict, now: datetime,
+                            *, not_before: datetime | None = None) -> datetime:
+    """Первое вхождение серии (DTSTART для RRULE), не раньше `now`.
+
+    RFC 5545 требует, чтобы DTSTART совпадал с правилом повтора. Дефект:
+    «Английский каждую среду и пятницу с 8:00 до 9:30» — парсер брал из текста
+    «пятницу» как дату старта, и .ics получал DTSTART=пятница при BYDAY=WE,FR:
+    среда текущей недели выпадала из серии, а часть календарей показывала только
+    DTSTART (одно событие). Здесь старт сдвигается к ближайшему вхождению правила.
+
+    not_before — явная дата начала серии из текста («каждую среду с 7 октября»).
+    """
+    if start is None or not recurrence:
+        return start
+    rrule = recurrence_rrule(recurrence)
+    if not rrule:
+        return start
+    from dateutil.rrule import rrulestr  # импорт тяжёлый — лениво
+
+    tz = start.tzinfo
+    moment = now
+    if not_before is not None:
+        hint = not_before if not_before.tzinfo else not_before.replace(tzinfo=tz)
+        moment = max(moment, hint) if moment.tzinfo else hint
+
+    # Виртуальный dtstart на период раньше: dateutil отдаёт вхождения не раньше
+    # dtstart, поэтому от исходной (возможно, поздней) даты ближайшая среда/вторник
+    # не находились.
+    freq = str(recurrence.get("freq") or "WEEKLY").upper()
+    interval = recurrence.get("interval")
+    step = int(float(interval)) if _is_num(interval) and float(interval) > 1 else 1
+    if freq == "WEEKLY":
+        virtual = start - timedelta(weeks=step)
+    elif freq == "DAILY":
+        virtual = start - timedelta(days=step)
+    else:  # MONTHLY/YEARLY: фаза задаётся днём месяца/даты в dtstart
+        virtual = start
+    try:
+        rule = rrulestr(rrule, dtstart=virtual)
+        candidate = rule.after(moment - timedelta(seconds=1), inc=True)
+    except (ValueError, TypeError, OverflowError):
+        return start
+    if candidate is None:
+        return start
+    try:
+        candidate = candidate.astimezone(tz) if tz else candidate
+    except (ValueError, OverflowError):
+        return start
+    codes = recurrence_byday(recurrence)
+    if codes and RRULE_WEEKDAYS[candidate.weekday()] not in codes:
+        return start  # страховка: правило и день недели разошлись — не ломаем дату
+    return candidate
+
+
+def align_series_start(draft: "EventDraft", now: datetime,
+                       not_before: datetime | None = None) -> bool:
+    """Сдвигает DTSTART повторяющегося события к первому вхождению правила.
+
+    Длительность сохраняется: конец пересчитывается на ту же разницу.
+    Возвращает True, если дата начала изменилась.
+    """
+    if draft.start is None or not draft.recurrence:
+        return False
+    new_start = first_series_occurrence(draft.start, draft.recurrence, now,
+                                        not_before=not_before)
+    if new_start == draft.start:
+        return False
+    shift = new_start - draft.start
+    draft.start = new_start
+    if draft.end is not None:
+        draft.end = draft.end + shift
+    return True
 
 
 def rrule_to_recurrence(rrule: str | None) -> dict | None:
@@ -86,8 +197,13 @@ class EventDraft:
     # ---------- построение из ответа AI ----------
 
     @classmethod
-    def from_ai_json(cls, data: dict, tz: ZoneInfo, now: datetime) -> "EventDraft | None":
-        """Валидирует JSON от AI-модуля и собирает черновик (ТЗ §2.1 п.3)."""
+    def from_ai_json(cls, data: dict, tz: ZoneInfo, now: datetime,
+                     not_before: datetime | None = None) -> "EventDraft | None":
+        """Валидирует JSON от AI-модуля и собирает черновик (ТЗ §2.1 п.3).
+
+        not_before — явная дата начала серии из текста («каждую среду с 7 октября»);
+        нужна, чтобы DTSTART не «уезжал» к ближайшему вхождению раньше этой даты.
+        """
         if not isinstance(data, dict) or not data.get("is_event"):
             return None
 
@@ -103,8 +219,12 @@ class EventDraft:
             if start is not None:
                 missing = [m for m in missing if m != "time"]
 
+        end_date_raw = data.get("end_date")
+        has_end_date = bool(end_date_raw) and str(end_date_raw) != str(data.get("date") or "")
+        has_times = data.get("time") is not None or data.get("end_time") is not None
+        # «отпуск с 5 по 10 октября»: дат две, времени нет -> событие на весь день
+        all_day = (bool(data.get("all_day")) or (has_end_date and not has_times)) and not has_times
         end = None
-        all_day = bool(data.get("all_day")) and data.get("time") is None
         assumptions = _assumptions_from(data.get("assumptions"))
         if start is not None:
             # «без тихих дефолтов» (issue #13): время не указано -> явный дефолт
@@ -115,11 +235,18 @@ class EventDraft:
                     hour=DEFAULT_TIME.hour, minute=DEFAULT_TIME.minute,
                     second=0, microsecond=0,
                 )
-            if data.get("end_time"):
+            if has_end_date:
+                # Конец многосуточного события: последний день (для all-day —
+                # включительно; в .ics/Google он станет exclusive-датой +1 день).
+                end = _compose(end_date_raw, data.get("end_time") or data.get("time"), tz, now)
+                if end is not None and end < start:
+                    start, end = end, start
+            elif data.get("end_time"):
                 end = _compose(data.get("date"), data.get("end_time"), tz, now)
                 if end and end < start:
                     end += timedelta(days=1)
             duration_defaulted = False
+            duration = None
             if end is None and not all_day:
                 dur = data.get("duration_minutes")
                 duration_defaulted = not (_is_num(dur) and float(dur) > 0)
@@ -130,7 +257,7 @@ class EventDraft:
             if time_defaulted:
                 span = f"{start:%H:%M}–{end:%H:%M}" if end else f"{start:%H:%M}"
                 assumptions.append(f"время не было указано — поставил дефолт {span}")
-            if duration_defaulted:
+            if duration_defaulted and duration is not None:
                 mins = int(duration.total_seconds() // 60)
                 assumptions.append(
                     f"длительность не была указана — поставил дефолт "
@@ -141,7 +268,7 @@ class EventDraft:
         recurrence = rec if isinstance(rec, dict) and rec.get("freq") else None
 
         conf = data.get("confidence")
-        return cls(
+        draft = cls(
             title=title,
             start=start,
             end=end,
@@ -155,6 +282,10 @@ class EventDraft:
             raw_text=str(data.get("raw_text") or ""),
             assumptions=assumptions,
         )
+        # DTSTART повторяющегося события обязан совпадать с RRULE (RFC 5545),
+        # иначе среда/вторник текущей недели выпадают из серии (см. дефект #4).
+        align_series_start(draft, now, not_before=not_before)
+        return draft
 
     # ---------- запросы к пользователю ----------
 
@@ -180,35 +311,29 @@ class EventDraft:
 
     @property
     def rrule(self) -> str | None:
-        if not self.recurrence:
-            return None
-        freq = str(self.recurrence.get("freq", "weekly")).upper()
-        parts = [f"FREQ={freq}"]
-        byday = self.recurrence.get("byday")
-        if byday:
-            parts.append(f"BYDAY={byday}")
-        interval = self.recurrence.get("interval")
-        if _is_num(interval) and float(interval) > 1:
-            parts.append(f"INTERVAL={int(float(interval))}")
-        return ";".join(parts)
+        return recurrence_rrule(self.recurrence)
 
     @property
     def recurrence_human(self) -> str | None:
         if not self.recurrence:
             return None
         freq = str(self.recurrence.get("freq", "weekly")).lower()
-        byday = self.recurrence.get("byday")
-        names = " и ".join(
-            WEEKDAYS_RU.get(d.strip().upper(), d) for d in str(byday).split(",")
-        ) if byday else ""
-        return {
-            ("daily", ""): "каждый день",
-            ("weekly", ""): "каждую неделю",
-            ("monthly", ""): "каждый месяц",
-        }.get((freq, names)) or (
-            f"каждые {'недели' if freq == 'weekly' else 'дни' if freq == 'daily' else 'месяцы'}"
-            + (f" по {names}" if names else "")
-        )
+        interval = self.recurrence.get("interval")
+        step = int(float(interval)) if _is_num(interval) and float(interval) > 1 else 1
+        base = {
+            "daily": "каждый день" if step == 1
+            else f"каждые {step} {plural_ru(step, 'день', 'дня', 'дней')}",
+            "weekly": "каждую неделю" if step == 1
+            else f"каждые {step} {plural_ru(step, 'неделю', 'недели', 'недель')}",
+            "monthly": "каждый месяц" if step == 1
+            else f"каждые {step} {plural_ru(step, 'месяц', 'месяца', 'месяцев')}",
+        }.get(freq, "каждую неделю")
+        codes = recurrence_byday(self.recurrence)
+        if codes:
+            # «каждую неделю по средам и пятницам» (дательный падеж)
+            names = " и ".join(WEEKDAYS_RU_DATIVE.get(c, WEEKDAYS_RU.get(c, c)) for c in codes)
+            return f"{base} по {names}"
+        return base
 
     # ---------- представление для пользователя ----------
 
@@ -219,12 +344,27 @@ class EventDraft:
         if self.start:
             when = self.start.strftime("%d.%m.%Y")
             when += f" ({WEEKDAYS_RU_FULL[self.start.weekday()]})"
-            if not self.all_day:
+            if self.all_day:
+                last = (self.end or self.start).date()
+                if last > self.start.date():  # многодневное событие: «05.10–10.10»
+                    days = (last - self.start.date()).days + 1
+                    when = (
+                        f"{self.start:%d.%m.%Y}–{last:%d.%m.%Y} "
+                        f"({days} {plural_ru(days, 'день', 'дня', 'дней')}), весь день"
+                    )
+                else:
+                    when += ", весь день"
+            else:
                 when += ", " + self.start.strftime("%H:%M")
                 if self.end:
-                    when += f"–{self.end.strftime('%H:%M')}"
-            else:
-                when += ", весь день"
+                    if self.end.date() != self.start.date():
+                        # многодневное с временем: «10:00 – 10.10.2026 (сб) 18:00»
+                        when += (
+                            f" – {self.end:%d.%m.%Y} "
+                            f"({WEEKDAYS_RU_FULL[self.end.weekday()]}) {self.end:%H:%M}"
+                        )
+                    else:
+                        when += f"–{self.end.strftime('%H:%M')}"
             lines.append(f"📅 {when} <i>({tz_name})</i>")
         else:
             lines.append("📅 <i>дата не определена</i>")

@@ -5,7 +5,11 @@
 - monthly-RRULE на 31-е число (короткий месяц пропускается, а не сдвигается);
 - диапазон через полночь;
 - согласованность .ics: DTSTART/DTEND/TZID/RRULE, all-day, экранирование,
-  фолдинг строк, имя файла, build_gcal_link (timed и all-day).
+  фолдинг строк, имя файла, build_gcal_link (timed и all-day);
+- дефекты 29.09.2026: серия «каждую среду и пятницу» (DTSTART = ближайшее
+  вхождение правила, а не «пятница») и события на несколько дней
+  («с 5 по 10 октября» -> all-day с эксклюзивным DTEND), включая страховки,
+  когда модель не вернула recurrence/end_date.
 
 Офлайн: LLM не используется, только локальный парсер и модели.
 Запуск: python tests/test_parsing_ics.py
@@ -13,6 +17,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 import sys
 from datetime import datetime
@@ -21,8 +27,12 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bot.models import EventDraft  # noqa: E402
-from bot.services.extractor import extract_event_local, extract_events_local  # noqa: E402
+from bot.models import EventDraft, RRULE_WEEKDAYS  # noqa: E402
+from bot.services.extractor import (  # noqa: E402
+    extract_event_local,
+    extract_events,
+    extract_events_local,
+)
 from bot.services.ics import build_ics, build_gcal_link, safe_filename  # noqa: E402
 from bot.handlers.manage import compose_move, parse_manage_intent  # noqa: E402
 
@@ -206,10 +216,159 @@ link = build_gcal_link(d90)
 check("gcal-link: timed — даты в UTC (10:00 MSK = 07:00Z)",
       link and "dates=20260928T070000Z%2F20260928T083000Z" in link, link or "None")
 linka = build_gcal_link(dall)
-check("gcal-link: all-day — dates=YYYYMMDD/YYYYMMDD",
-      linka and "dates=20261015%2F20261015" in linka, linka or "None")
+check("gcal-link: all-day — DTEND эксклюзивен (+1 день)",
+      linka and "dates=20261015%2F20261016" in linka, linka or "None")
 check("gcal-link: без даты -> None",
       build_gcal_link(EventDraft(title="X")) is None)
+
+
+# ============ дефекты 29.09.2026: повторы и события на несколько дней ============
+# 1) «каждую среду и пятницу» давала DTSTART=пятница: среда текущей недели
+#    выпадала из серии, а часть календарей показывала только DTSTART.
+drec2 = extract_event_local("Английский каждую среду и пятницу с 8:00 до 9:30", TZ, NOW)
+check("deffekt-1: «каждую среду и пятницу с 8:00 до 9:30» -> BYDAY=WE,FR",
+      drec2 is not None and (drec2.recurrence or {}).get("byday") == "WE,FR",
+      f"rec={drec2.recurrence if drec2 else None}")
+check("deffekt-1: первое вхождение — среда 30.09 08:00, а не пятница 02.10",
+      drec2 is not None and drec2.start == dt(2026, 9, 30, 8, 0),
+      str(drec2.start if drec2 else None))
+check("deffekt-1: диапазон 8:00–9:30 сохранён",
+      drec2 is not None and drec2.end == dt(2026, 9, 30, 9, 30),
+      str(drec2.end if drec2 else None))
+icsr2 = build_ics(drec2, TZ).decode("utf-8") if drec2 else ""
+check("deffekt-1: .ics — DTSTART среда + RRULE WE,FR",
+      "DTSTART;TZID=Europe/Moscow:20260930T080000" in icsr2
+      and "RRULE:FREQ=WEEKLY;BYDAY=WE,FR" in icsr2, icsr2[:400])
+_m = re.search(r"DTSTART;TZID=\S+:(\d{8}T\d{6})", icsr2)
+_ics_start = (datetime.strptime(_m.group(1), "%Y%m%dT%H%M%S").replace(tzinfo=ZoneInfo(TZ))
+              if _m else None)
+_occ = ([o.strftime("%d.%m") for o in
+         rrulestr("FREQ=WEEKLY;BYDAY=WE,FR", dtstart=_ics_start).xafter(
+             dt(2026, 9, 30, 0, 0), count=4, inc=True)] if _ics_start else [])
+check("deffekt-1: серия из .ics: ср 30.09, пт 02.10, ср 07.10, пт 09.10",
+      _occ == ["30.09", "02.10", "07.10", "09.10"], str(_occ))
+check("deffekt-1: DTSTART совпадает с BYDAY (RFC 5545)",
+      drec2 is not None and RRULE_WEEKDAYS[drec2.start.weekday()] in
+      (drec2.recurrence or {}).get("byday", ""), str(drec2.start if drec2 else None))
+
+# 2) События на несколько дней: «с 5 по 10 октября» — раньше становилось
+#    часовым событием 10.10.
+dper = extract_event_local("отпуск с 5 по 10 октября", TZ, NOW)
+check("deffekt-2: «отпуск с 5 по 10 октября» -> 05.10–10.10, весь день",
+      dper is not None and dper.all_day
+      and dper.start.date() == dt(2026, 10, 5).date()
+      and dper.end.date() == dt(2026, 10, 10).date(),
+      f"{dper.start if dper else None} -> {dper.end if dper else None}")
+icsp = build_ics(dper, TZ).decode("utf-8") if dper else ""
+check("deffekt-2: .ics — DTSTART 05.10, DTEND эксклюзивный 11.10",
+      "DTSTART;VALUE=DATE:20261005" in icsp and "DTEND;VALUE=DATE:20261011" in icsp,
+      icsp[:400])
+check("deffekt-2: в предпросмотре видны дни и «весь день»",
+      dper is not None and "05.10.2026–10.10.2026" in dper.preview_text(TZ)
+      and "6 дней" in dper.preview_text(TZ),
+      dper.preview_text(TZ) if dper else "None")
+dper2 = extract_event_local("семинар 15-17 октября", TZ, NOW)
+check("deffekt-2: «15-17 октября» -> 15.10–17.10",
+      dper2 is not None and dper2.start.date() == dt(2026, 10, 15).date()
+      and dper2.end.date() == dt(2026, 10, 17).date(),
+      f"{dper2.start if dper2 else None} -> {dper2.end if dper2 else None}")
+dper3 = extract_event_local("отпуск на 3 дня с 5 октября", TZ, NOW)
+check("deffekt-2: «на 3 дня с 5 октября» -> 05.10–07.10",
+      dper3 is not None and dper3.start.date() == dt(2026, 10, 5).date()
+      and dper3.end.date() == dt(2026, 10, 7).date(),
+      f"{dper3.start if dper3 else None} -> {dper3.end if dper3 else None}")
+dper4 = extract_event_local("конференция с 5 по 10 октября с 10:00 до 18:00", TZ, NOW)
+check("deffekt-2: многодневное с временем -> 05.10 10:00 – 10.10 18:00",
+      dper4 is not None and not dper4.all_day
+      and dper4.start == dt(2026, 10, 5, 10, 0) and dper4.end == dt(2026, 10, 10, 18, 0),
+      f"{dper4.start if dper4 else None} -> {dper4.end if dper4 else None}")
+
+# 2б) Повтор без «каждую»: дательный падеж («по средам и пятницам») и диапазон
+#     времени без предлога «с» («8:00-9:30»).
+dper5 = extract_event_local("английский по средам и пятницам 8:00-9:30", TZ, NOW)
+check("deffekt-1: «по средам и пятницам 8:00-9:30» -> среда 30.09, 08:00–09:30",
+      dper5 is not None and dper5.start == dt(2026, 9, 30, 8, 0)
+      and dper5.end == dt(2026, 9, 30, 9, 30)
+      and (dper5.recurrence or {}).get("byday") == "WE,FR",
+      f"{dper5.start if dper5 else None} -> {dper5.end if dper5 else None}, "
+      f"rec={dper5.recurrence if dper5 else None}")
+dper6 = extract_event_local("занятия по вторникам и четвергам с 19:00 до 20:00", TZ, NOW)
+check("deffekt-1: «по вторникам и четвергам» -> вторник 29.09, 19:00–20:00",
+      dper6 is not None and dper6.start == dt(2026, 9, 29, 19, 0)
+      and dper6.end == dt(2026, 9, 29, 20, 0)
+      and (dper6.recurrence or {}).get("byday") == "TU,TH"
+      and "BYDAY=TU,TH" in (dper6.rrule or ""),
+      f"{dper6.start if dper6 else None} -> {dper6.end if dper6 else None}, "
+      f"rrule={dper6.rrule if dper6 else None}")
+
+# 3) AI-путь: end_date в JSON и выравнивание DTSTART повтора
+dai = EventDraft.from_ai_json(
+    {"is_event": True, "title": "Отпуск", "date": "2026-10-05", "end_date": "2026-10-10",
+     "time": None, "end_time": None, "all_day": True, "recurrence": None,
+     "confidence": 0.9, "missing": [], "assumptions": []},
+    tz=ZoneInfo(TZ), now=NOW,
+)
+check("deffekt-2 (AI): end_date -> all-day 05.10–10.10",
+      dai is not None and dai.all_day and dai.start.date() == dt(2026, 10, 5).date()
+      and dai.end.date() == dt(2026, 10, 10).date(),
+      f"{dai.start if dai else None} -> {dai.end if dai else None}")
+dai2 = EventDraft.from_ai_json(
+    {"is_event": True, "title": "Английский", "date": "2026-10-02", "time": "08:00",
+     "end_time": "09:30", "all_day": False,
+     "recurrence": {"freq": "WEEKLY", "byday": "WE,FR"},
+     "confidence": 0.9, "missing": [], "assumptions": []},
+    tz=ZoneInfo(TZ), now=NOW,
+)
+check("deffekt-1 (AI): DTSTART выровнен к среде 30.09",
+      dai2 is not None and dai2.start == dt(2026, 9, 30, 8, 0)
+      and dai2.end == dt(2026, 9, 30, 9, 30),
+      f"{dai2.start if dai2 else None} -> {dai2.end if dai2 else None}")
+
+
+# 4) Страховки AI-пути: модель «забыла» повтор или многодневность — достраиваем
+#    по тексту (в боевом логе именно так терялись RRULE и второй день).
+class _LazyLLM:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    async def chat(self, system: str, user: str, **kw) -> str:
+        return json.dumps(self.payload, ensure_ascii=False)
+
+
+_lazy_rec = _LazyLLM({
+    "is_event": True, "title": "Английский", "date": "2026-10-02", "time": "08:00",
+    "end_time": "09:30", "all_day": False, "recurrence": None,
+    "confidence": 0.9, "missing": [], "assumptions": [],
+})
+_ls = asyncio.run(extract_events(_lazy_rec, "Английский каждую среду и пятницу с 8:00 до 9:30",
+                                 TZ, NOW))
+check("deffekt-1 (страховка): модель без recurrence -> правило из текста, среда 30.09",
+      len(_ls) == 1 and (_ls[0].recurrence or {}).get("byday") == "WE,FR"
+      and _ls[0].start == dt(2026, 9, 30, 8, 0),
+      f"rec={_ls[0].recurrence if _ls else None} start={_ls[0].start if _ls else None}")
+
+_lazy_days = _LazyLLM({
+    "is_event": True, "title": "Отпуск", "date": "2026-10-05", "time": None,
+    "end_time": None, "all_day": False, "recurrence": None,
+    "confidence": 0.9, "missing": [], "assumptions": [],
+})
+_ld = asyncio.run(extract_events(_lazy_days, "отпуск с 5 по 10 октября", TZ, NOW))
+check("deffekt-2 (страховка): модель без end_date -> многодневное all-day 05.10–10.10",
+      len(_ld) == 1 and _ld[0].all_day and _ld[0].start.date() == dt(2026, 10, 5).date()
+      and _ld[0].end.date() == dt(2026, 10, 10).date(),
+      f"{_ld[0].start if _ld else None} -> {_ld[0].end if _ld else None}")
+
+_lazy_timed = _LazyLLM({
+    "is_event": True, "title": "Конференция", "date": "2026-10-05", "time": "10:00",
+    "end_time": "18:00", "all_day": False, "recurrence": None,
+    "confidence": 0.9, "missing": [], "assumptions": [],
+})
+_lt = asyncio.run(extract_events(_lazy_timed, "конференция с 5 по 10 октября с 10:00 до 18:00",
+                                 TZ, NOW))
+check("deffekt-2 (страховка): время сохранено, конец 10.10 18:00",
+      len(_lt) == 1 and not _lt[0].all_day and _lt[0].start == dt(2026, 10, 5, 10, 0)
+      and _lt[0].end == dt(2026, 10, 10, 18, 0),
+      f"{_lt[0].start if _lt else None} -> {_lt[0].end if _lt else None}")
 
 if failed:
     print(f"\nИтог: {passed} ок, {failed} провалено")

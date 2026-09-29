@@ -428,15 +428,22 @@ async def main() -> None:
         check("C2c напоминания запланированы на вхождения (event_pk сохранён)",
               len(rem_fr) >= 1, f"pk={pk_fr} n={len(rem_fr)}")
 
-        # C3: /today и /tomorrow с повторяющимся событием
+        # C3: /today и /tomorrow с повторяющимся событием. Первое вхождение
+        # серии — ближайшее ≥ «сейчас» (критерий issue #4: «каждый день» — DAILY,
+        # первое вхождение ≥ «сейчас»). «Каждый день в 09:00», созданный после
+        # 09:00, начинается завтра — тогда он виден в /tomorrow, а не в /today.
         calls = await feed(_msg(OWN, "каждый день в 09:00 звонок"))
         await feed(_cbq(OWN, "ev:create"))
-        calls = await feed(_msg(OWN, "/today"))
-        check("C3a /today: вхождение ежедневного события в сегодня",
+        daily = [r for r in await db.all_events() if r["title"] == "Ежедневный звонок"]
+        target = "/today"
+        if daily:
+            target = "/today" if _msk(daily[0]["start_iso"]).date() == TODAY.date() else "/tomorrow"
+        calls = await feed(_msg(OWN, target))
+        check(f"C3a {target}: вхождение ежедневного события в свой день",
               any("Ежедневный звонок" in t and "🔁" in t for t in texts(calls)),
-              str(texts(calls)))
+              f"{target} {texts(calls)}")
         calls = await feed(_msg(OWN, "/tomorrow"))
-        check("C3b /tomorrow: вхождение ежедневного события в завтра",
+        check("C3b /tomorrow: следующее вхождение ежедневного события",
               any("Ежедневный звонок" in t for t in texts(calls)),
               str(texts(calls)))
 

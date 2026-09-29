@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime
 
 from aiogram import F, Router
 from aiogram.enums import ChatAction
@@ -23,7 +24,7 @@ from aiogram.types import (
 
 from bot.config import Config
 from bot.handlers.common import OwnerFilter, esc, get_calendar_id, get_tz_name
-from bot.models import EventDraft, multi_preview_text, plural_ru
+from bot.models import EventDraft, align_series_start, get_tz, multi_preview_text, plural_ru
 from bot.reminders import reminder_minutes, schedule_for_event
 from bot.services.extractor import extract_event, extract_event_local, extract_events, extract_events_local
 from bot.services.gcal import GCalClient, GCalError
@@ -244,12 +245,15 @@ async def on_clarify(message: Message, state: FSMContext, cfg: Config, db) -> No
         await db.log_request("clarify", "retry", message.text[:120])
         return
     targets = data.get("drafts") or [draft]
+    now = datetime.now(tz=get_tz(tz_name))
     for item in targets:
         if item and item.needs_date:
             item.start = local.start
             item.end = local.end
             item.all_day = item.all_day and local.all_day
             item.missing = [m for m in item.missing if m not in ("date", "time")]
+            # повтор: уточнённая дата должна совпадать с RRULE (среда для WE,FR)
+            align_series_start(item, now)
     if data.get("drafts"):
         await _show_multi_preview(message, state, targets, tz_name)
     else:
