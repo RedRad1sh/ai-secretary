@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from bot.models import EventDraft
@@ -72,7 +72,10 @@ class GCalClient:
         if draft.all_day:
             d = draft.start.date().isoformat()
             start_body: dict[str, Any] = {"date": d}
-            end_body: dict[str, Any] = {"date": draft.end.date().isoformat() if draft.end else d}
+            # draft.end — последний день включительно; Google ждёт exclusive-дату,
+            # поэтому для многодневных событий конец = последний день + 1
+            last_day = (draft.end or draft.start).date()
+            end_body: dict[str, Any] = {"date": (last_day + timedelta(days=1)).isoformat()}
         else:
             start_body = {"dateTime": draft.start.isoformat(), "timeZone": tz_name}
             end_body = {

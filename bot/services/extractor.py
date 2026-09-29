@@ -9,9 +9,17 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
-from bot.models import EventDraft, get_tz, parse_ai_json
+from bot.models import (
+    EventDraft,
+    align_series_start,
+    first_series_occurrence,
+    get_tz,
+    parse_ai_json,
+    recurrence_byday,
+    RRULE_WEEKDAYS,
+)
 from bot.services.llm import LLMError
 
 log = logging.getLogger(__name__)
@@ -28,6 +36,7 @@ PROMPT = """Ты — модуль извлечения событий для к�
   "is_event": true,
   "title": "str",
   "date": "YYYY-MM-DD" | null,
+  "end_date": "YYYY-MM-DD" | null,
   "time": "HH:MM" | null,
   "end_time": "HH:MM" | null,
   "duration_minutes": int | null,
@@ -44,8 +53,8 @@ PROMPT = """Ты — модуль извлечения событий для к�
 ЕСЛИ В ТЕКСТЕ НЕСКОЛЬКО СОБЫТИЙ (например: «завтра в 11:00 дейлик, а в 10:00 подготовка») — верни:
 {{
   "events": [
-    {{"title": "str", "date": "YYYY-MM-DD", "time": "HH:MM", "end_time": null, "duration_minutes": null, "all_day": false, "location": null, "participants": null, "description": null, "recurrence": null, "confidence": 0.9, "missing": [], "assumptions": []}},
-    {{"title": "str", "date": "YYYY-MM-DD", "time": "HH:MM", ...}}
+    {{"title": "str", "date": "YYYY-MM-DD", "end_date": null, "time": "HH:MM", "end_time": null, "duration_minutes": null, "all_day": false, "location": null, "participants": null, "description": null, "recurrence": null, "confidence": 0.9, "missing": [], "assumptions": []}},
+    {{"title": "str", "date": "YYYY-MM-DD", "end_date": null, "time": "HH:MM", ...}}
   ]
 }}
 
@@ -53,6 +62,9 @@ PROMPT = """Ты — модуль извлечения событий для к�
 - Если это не событие/дело/напоминание — верни {{"is_event": false}}.
 - Для каждого события вычисли дату/время отдельно (завтра = {tomorrow}).
 - Не выдумывай дату: если не можешь определить — null и добавь в missing.
+- Событие на несколько дней («отпуск с 5 по 10 октября», «конференция 12–14 октября», «командировка с 1 по 3 ноября», «отель с 5.10 по 10.10», «на 3 дня с 5 октября»): date = первый день, end_date = последний день ВКЛЮЧИТЕЛЬНО. Если время не указано — all_day = true, time = null, end_time = null. Пример: «отпуск с 5 по 10 октября» -> date = "{year}-10-05", end_date = "{year}-10-10", all_day = true.
+- Однодневное событие: end_date = null.
+- Повтор («каждую среду и пятницу», «по будням»): date — ближайший подходящий день недели НЕ РАНЬШЕ сегодняшнего ({weekday}, {now}), время — указанное. Не переноси первый день серии на следующую неделю и не выбирай из списка дней только один последний.
 - assumptions — список допущений, которые ты сделал ЗА пользователя (пустой, если всё взято из текста). См. «ПЛАНОВЫЕ ЗАПРОСЫ».
 
 ПЛАНОВЫЕ ЗАПРОСЫ (серии похожих событий: «план/программа на неделю», «создай N событий», «распиши тренировки»):
@@ -80,6 +92,7 @@ async def extract_events(
         tz_name=tz_name,
         weekday=weekday,
         tomorrow=_iso_plus_days(now, 1),
+        year=now.year,
     )
     try:
         answer = await llm.chat(system, text)
@@ -119,13 +132,16 @@ async def extract_events(
             drafts.append(d)
         if drafts:
             log.info("AI извлёк %s событий: %s", len(drafts), ", ".join(f"«{x.title}»" for x in drafts))
+            _apply_date_period(drafts, text, now, tz_name)
+            _reconcile_recurrence(drafts, text, now, tz_name)
             _mark_assumed_time(drafts, text)
             return drafts
         # если events пустой — считаем не событием
         return []
 
     # старый формат одиночного объекта
-    draft = EventDraft.from_ai_json(data, tz=get_tz(tz_name), now=now)
+    draft = EventDraft.from_ai_json(data, tz=get_tz(tz_name), now=now,
+                                    not_before=_hint_for(tz_name, text, now))
     if draft is None:
         return []
     log.info("AI извлёк событие: «%s», уверенность %.2f", draft.title, draft.confidence)
@@ -137,8 +153,143 @@ async def extract_events(
             draft.missing = [m for m in draft.missing if m != "date"]
     if not draft.title or draft.title.lower() in ("событие", "event"):
         draft.title = (text.strip().splitlines() or ["Событие"])[0][:80]
+    _apply_date_period([draft], text, now, tz_name)
+    _reconcile_recurrence([draft], text, now, tz_name)
     _mark_assumed_time([draft], text)
     return [draft]
+
+
+_CLOCK_RE = re.compile(r"\b(?P<prep>в|с)\s+(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\b")
+
+
+def _date_follows(text: str, m: re.Match) -> bool:
+    """«с 7 октября», «с 5.10» — после числа идёт дата, а не время."""
+    tail = text[m.end():]
+    if re.match(r"\s*[./]\s*\d{1,2}", tail):
+        return True
+    return bool(re.match(rf"\s+{_MONTH_RE}", tail, re.I))
+
+
+def _has_time_outside(text: str, span: tuple[int, int]) -> bool:
+    """Есть ли в тексте время суток вне диапазона дат («с 5 по 10 октября» — нет)."""
+    for m in _CLOCK_RE.finditer(text):
+        if span[0] <= m.start() < span[1]:
+            continue
+        if m["prep"] == "с" and _date_follows(text, m):
+            continue
+        if _int_in(m["h"], 0, 23) is not None and _int_in(m["m"] or "0", 0, 59) is not None:
+            return True
+    for rx in (_TIME_RANGE, _BARE_TIME_RANGE):
+        for m in rx.finditer(text):
+            if m.end() <= span[0] or m.start() >= span[1]:
+                return True
+    return False
+
+
+def _nearest_byday_candidate(recurrence: dict | None, text: str, now: datetime,
+                             tz_name: str) -> datetime | None:
+    """Ближайший подходящий день недели под правило (страховка офлайн-парсера)."""
+    codes = recurrence_byday(recurrence)
+    if not codes:
+        return None
+    clock = _pick_clock(text)
+    hour, minute = (int(clock["h"]), int(clock["m"] or 0)) if clock else (0, 0)
+    tz = get_tz(tz_name)
+    for offset in range(0, 15):
+        day = (now + timedelta(days=offset)).date()
+        if RRULE_WEEKDAYS[day.weekday()] not in codes:
+            continue
+        candidate = datetime.combine(day, time(hour, minute), tzinfo=tz)
+        if candidate >= now:
+            return candidate
+    return None
+
+
+def _pick_clock(text: str) -> re.Match | None:
+    """Время события: предпочитаем «в 15:00», пропускаем «с 7 октября»."""
+    best, best_score = None, -1
+    for m in _CLOCK_RE.finditer(text):
+        if _int_in(m["h"], 0, 23) is None or _int_in(m["m"] or "0", 0, 59) is None:
+            continue
+        if m["prep"] == "с" and _date_follows(text, m):
+            continue  # «с 7 октября» — дата, не время
+        score = (2 if m["prep"] == "в" else 0) + (1 if m["m"] else 0)
+        if score > best_score:
+            best, best_score = m, score
+    return best
+
+
+def _hint_for(tz_name: str, text: str, now: datetime) -> datetime | None:
+    """Явное начало серии из текста, с защитой от сбоев парсера шаблонов."""
+    try:
+        return series_start_hint(text, tz_name, now)
+    except Exception:  # noqa: BLE001 — подсказка не должна ломать разбор
+        log.debug("series_start_hint упал на тексте: %.120r", text)
+        return None
+
+
+def _apply_date_period(drafts: list[EventDraft], text: str, now: datetime,
+                       tz_name: str) -> None:
+    """Достраивает конец многодневного события, если модель увидела только первый
+    день («отпуск с 5 по 10 октября» -> одно однодневное событие). Если во всём
+    запросе нет времени, событие переводится в режим «весь день»."""
+    if len(drafts) != 1:
+        return
+    draft = drafts[0]
+    if draft.start is None:
+        return
+    if draft.end is not None and draft.end.date() > draft.start.date():
+        return  # уже многодневное (end_date пришёл от модели)
+    period = local_date_period(text, now)
+    if period is None:
+        return
+    start_date, end_date, span = period
+    if draft.start.date() not in (start_date, end_date):
+        return  # модель назвала другую дату — не подменяем её
+    tz = draft.start.tzinfo
+    start = draft.start.replace(year=start_date.year, month=start_date.month, day=start_date.day)
+    all_day = draft.all_day or not _has_time_outside(text, span)
+    if all_day:
+        draft.start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        draft.end = datetime(end_date.year, end_date.month, end_date.day, tzinfo=tz)
+        draft.all_day = True
+        draft.missing = [m for m in draft.missing if m != "time"]
+        # «время не указано» снимается: событие осознанно на весь день
+        draft.assumptions = [
+            a for a in draft.assumptions
+            if "время не было указано" not in a and "длительность не была указана" not in a
+        ]
+    else:
+        draft.start = start
+        end_time = (draft.end or draft.start).timetz().replace(tzinfo=None)
+        end = datetime.combine(end_date, end_time, tzinfo=tz)
+        draft.end = end if end > start else start + timedelta(hours=1)
+
+
+def _reconcile_recurrence(drafts: list[EventDraft], text: str, now: datetime,
+                          tz_name: str) -> None:
+    """Сверяет повтор из ответа AI с текстом («каждую среду и пятницу»).
+
+    Если модель забыла про повтор, а в тексте он явный — включаем правило сами:
+    иначе .ics уходит без RRULE, и в календаре остаётся одно событие.
+    Если модель назвала не все дни недели — дополняем их из текста.
+    """
+    if len(drafts) != 1:
+        return
+    local = local_recurrence(text)
+    if not local:
+        return
+    draft = drafts[0]
+    if not draft.recurrence:
+        draft.recurrence = dict(local)
+    elif (
+        str(draft.recurrence.get("freq", "")).upper() == "WEEKLY"
+        and str(local.get("freq", "")).upper() == "WEEKLY"
+    ):
+        codes = set(recurrence_byday(draft.recurrence)) | set(recurrence_byday(local))
+        if codes:
+            draft.recurrence["byday"] = ",".join(c for c in RRULE_WEEKDAYS if c in codes)
+    align_series_start(draft, now, not_before=_hint_for(tz_name, text, now))
 
 
 async def extract_event(
@@ -166,6 +317,13 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
     import dateparser  # импорт тяжёлый — лениво
 
     now = now or datetime.now(tz=get_tz(tz_name))
+
+    # Событие на несколько дней («с 5 по 10 октября», «12–14 октября»): разбираем
+    # диапазон дат явно, иначе dateparser делает из него часовое событие одного дня.
+    period = local_date_period(text, now)
+    if period:
+        return _draft_from_period(text, *period, now=now, tz_name=tz_name)
+
     settings = {
         "RELATIVE_BASE": now.replace(tzinfo=None),
         "PREFER_DATES_FROM": "future",
@@ -177,12 +335,16 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
         candidates.append(now.replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0))
     explicit_dates: set = set()
 
-    time_range = _TIME_RANGE.search(text)
-    if time_range and (int(time_range[1]) > 23 or int(time_range[3]) > 23 or int(time_range[2] or 0) > 59 or int(time_range[4] or 0) > 59):
+    time_range = _find_time_range(text)
+    if time_range is not None and not _valid_time_range(time_range):
         return None
     parse_text = text
     if time_range:
-        parse_text = text[:time_range.start()] + " в " + time_range.group(1) + ":" + (time_range.group(2) or "00") + text[time_range.end():]
+        # приводим диапазон к «в HH:MM», чтобы датапарсер/часы увидели время начала
+        parse_text = (
+            text[:time_range.start()] + " в " + time_range["h1"] + ":"
+            + (time_range["m1"] or "00") + text[time_range.end():]
+        )
 
     # 1) Явные даты в тексте («29.09.2026», «15.10 в 18:30») — высший приоритет
     has_clock = bool(re.search(r"\b[вс]\s*\d{1,2}[:.]\d{2}\b", text.lower()))
@@ -261,6 +423,12 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
         filtered = [c for c in future if c.date() in explicit_dates]
         future = filtered or future
     if not future:
+        # dateparser/rutimeparser не всегда понимают «каждую среду в 8:00»
+        # (например, когда «сейчас» — воскресенье): считаем день недели сами.
+        fallback = _nearest_byday_candidate(local_recurrence(text), parse_text, now, tz_name)
+        if fallback is not None:
+            future = [fallback]
+    if not future:
         return None
     # При прочих равных предпочитаем кандидатов с временем (не полночь),
     # затем ближайший к «сейчас»
@@ -272,23 +440,25 @@ def extract_event_local(text: str, tz_name: str, now: datetime | None = None) ->
     if relative and not explicit_dates:
         day = now + timedelta(days={"сегодня": 0, "завтра": 1, "послезавтра": 2}[relative[1]])
         start = start.replace(year=day.year, month=day.month, day=day.day)
-    clock = re.search(r"\b(?:в|с)\s+(\d{1,2})(?::(\d{2}))?\b", parse_text)
-    if clock and int(clock[1]) < 24 and int(clock[2] or 0) < 60:
-        start = start.replace(hour=int(clock[1]), minute=int(clock[2] or 0), second=0, microsecond=0)
+    clock = _pick_clock(parse_text)
+    if clock:
+        start = start.replace(hour=int(clock["h"]), minute=int(clock["m"] or 0),
+                              second=0, microsecond=0)
     has_time = bool(clock) or _has_explicit_time(text)
     recurrence = local_recurrence(text)
     if recurrence:
-        probe = EventDraft(title="Событие", start=start, recurrence=recurrence)
-        occurrences = probe.next_occurrences(1, after=now, inclusive=True)
-        if occurrences:
-            start = occurrences[0]
+        # DTSTART серии = ближайшее вхождение правила (среда, а не пятница, для
+        # «каждую среду и пятницу»); явное «начиная с <дата>» учитывается.
+        start = first_series_occurrence(
+            start, recurrence, now, not_before=_hint_for(tz_name, text, now)
+        )
     end = start + timedelta(minutes=60) if has_time else None
     duration = re.search(r"\bна\s+(\d+)\s*(минут\w*|час\w*)", text.lower())
     if duration and has_time:
         end = start + timedelta(minutes=int(duration[1]) * (60 if duration[2].startswith("час") else 1))
     if time_range:
-        start = start.replace(hour=int(time_range[1]), minute=int(time_range[2] or 0))
-        end = start.replace(hour=int(time_range[3]), minute=int(time_range[4] or 0))
+        start = start.replace(hour=int(time_range["h1"]), minute=int(time_range["m1"] or 0))
+        end = start.replace(hour=int(time_range["h2"]), minute=int(time_range["m2"] or 0))
         if end <= start:
             end += timedelta(days=1)
 
@@ -324,7 +494,280 @@ def extract_events_local(text: str, tz_name: str, now: datetime | None = None) -
     return drafts
 
 
-_TIME_RANGE = re.compile(r"\bс\s+(\d{1,2})(?::(\d{2}))?\s*(?:до|[-–—])\s*(\d{1,2})(?::(\d{2}))?\b", re.I)
+_TIME_RANGE = re.compile(
+    r"\bс\s+(?P<h1>\d{1,2})(?::(?P<m1>\d{2}))?\s*(?:до|[-–—])\s*"
+    r"(?P<h2>\d{1,2})(?::(?P<m2>\d{2}))?\b",
+    re.I,
+)
+# «8:00-9:30», «8:00 до 9:30» — без предлога «с» (частый формат расписаний)
+_BARE_TIME_RANGE = re.compile(
+    r"(?<![\d:])(?P<h1>\d{1,2}):(?P<m1>\d{2})\s*(?:до|[-–—])\s*"
+    r"(?P<h2>\d{1,2}):(?P<m2>\d{2})(?![\d:])",
+    re.I,
+)
+
+
+def _find_time_range(text: str) -> re.Match | None:
+    """Диапазон времени в тексте: сначала «с 9:00 до 18:00», иначе «9:00-18:00»."""
+    return _TIME_RANGE.search(text) or _BARE_TIME_RANGE.search(text)
+
+
+def _valid_time_range(m: re.Match | None) -> bool:
+    if m is None:
+        return False
+    return (
+        _int_in(m["h1"], 0, 23) is not None
+        and _int_in(m["h2"], 0, 23) is not None
+        and _int_in(m["m1"] or "0", 0, 59) is not None
+        and _int_in(m["m2"] or "0", 0, 59) is not None
+    )
+
+
+# ============== диапазоны дат («с 5 по 10 октября», «на 3 дня с 5.10») ==============
+# Локальный парсер раньше не понимал события на несколько дней: «отпуск с 5 по
+# 10 октября» превращался в часовое событие 10.10, «конференция 12 октября по
+# 14 октября» — в событие 12.10 в 12:00. Здесь диапазон разбирается явно.
+
+_MONTH_STEMS: tuple[tuple[str, int], ...] = (
+    ("январ", 1), ("феврал", 2), ("март", 3), ("апрел", 4), ("ма", 5),
+    ("июн", 6), ("июл", 7), ("август", 8), ("сентябр", 9), ("октябр", 10),
+    ("ноябр", 11), ("декабр", 12),
+)
+# «ма[йяею]» — только само слово (май/мая/мае/маю), чтобы «маяк» не стал маем
+_MONTH_RE = (
+    r"(?:январ[а-яё]*|феврал[а-яё]*|март[а-яё]*|апрел[а-яё]*|ма[йяею]"
+    r"|июн[а-яё]*|июл[а-яё]*|август[а-яё]*|сентябр[а-яё]*|октябр[а-яё]*"
+    r"|ноябр[а-яё]*|декабр[а-яё]*)\b"
+)
+
+# «с 5 по 10 октября», «с 5.10 по 10.10», «12–14 октября», «с 30 сентября по 1 октября»
+_DATE_RANGE_RE = re.compile(
+    r"(?<![\d:а-яё])"
+    r"(?:с\s+)?"
+    r"(?P<d1>\d{1,2})(?:\s*[./]\s*(?P<m1>\d{1,2}))?(?:\s*[./]\s*(?P<y1>\d{2,4}))?"
+    rf"(?:\s+(?P<mon1>{_MONTH_RE}))?"
+    r"\s*(?:по|до|[-–—])\s*"
+    r"(?P<d2>\d{1,2})(?:\s*[./]\s*(?P<m2>\d{1,2}))?(?:\s*[./]\s*(?P<y2>\d{2,4}))?"
+    rf"(?:\s+(?P<mon2>{_MONTH_RE}))?",
+    re.I,
+)
+
+# «на 3 дня с 5 октября», «на 2 суток с 5.10.2026»
+_DAYS_SPAN_RE = re.compile(
+    r"\bна\s+(?P<n>\d{1,3})\s*(?:дн\w*|сут\w*)\s+с\s+"
+    r"(?P<d1>\d{1,2})(?:\s*[./]\s*(?P<m1>\d{1,2}))?(?:\s*[./]\s*(?P<y1>\d{2,4}))?"
+    rf"(?:\s+(?P<mon1>{_MONTH_RE}))?",
+    re.I,
+)
+
+# «каждую среду с 7 октября», «каждую пятницу начиная с 02.10» — явное начало серии
+_SERIES_START_RE = re.compile(
+    rf"(?:начин\w*|начн\w*)\s+с\s+(?P<a>\d{{1,2}}(?:\s*[./]\s*\d{{1,2}}){{1,2}}|\d{{1,2}}\s+{_MONTH_RE})"
+    rf"|(?<![\d:а-яё])с\s+(?P<b>\d{{1,2}}[./]\d{{1,2}}[./]\d{{2,4}}|\d{{1,2}}\s+{_MONTH_RE})",
+    re.I,
+)
+
+
+def _month_number(word: str | None) -> int | None:
+    if not word:
+        return None
+    w = word.strip().lower()
+    for stem, num in _MONTH_STEMS:
+        if w.startswith(stem):
+            return num
+    return None
+
+
+def _int_in(value: str | None, low: int, high: int) -> int | None:
+    if value is None:
+        return None
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return None
+    return num if low <= num <= high else None
+
+
+def _year_of(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        year = int(value)
+    except (TypeError, ValueError):
+        return None
+    if year < 100:
+        year += 2000
+    return year if 1900 <= year <= 2200 else None
+
+
+def _explicit_date(day_s: str | None, month_s: str | None, year_s: str | None,
+                   month_word: str | None, now: datetime) -> date | None:
+    """День + (номер месяца | название месяца) -> date, прошедшее — на следующий год."""
+    day = _int_in(day_s, 1, 31)
+    month = _int_in(month_s, 1, 12) or _month_number(month_word)
+    if day is None or month is None:
+        return None
+    year = _year_of(year_s) or now.year
+    try:
+        result = date(year, month, day)
+    except ValueError:
+        return None
+    if not year_s and result < now.date() - timedelta(days=1):
+        try:
+            result = result.replace(year=result.year + 1)
+        except ValueError:
+            return None
+    return result
+
+
+def _range_dates(m: re.Match, now: datetime) -> tuple[date, date] | None:
+    """Даты начала/конца из совпадения _DATE_RANGE_RE (без времени)."""
+    g = m.groupdict()
+    month1 = (
+        _int_in(g.get("m1"), 1, 12)
+        or _month_number(g.get("mon1"))
+        or _month_number(g.get("mon2"))
+        or _int_in(g.get("m2"), 1, 12)
+    )
+    month2 = (
+        _int_in(g.get("m2"), 1, 12)
+        or _month_number(g.get("mon2"))
+        or _month_number(g.get("mon1"))
+        or _int_in(g.get("m1"), 1, 12)
+    )
+    if month1 is None or month2 is None:
+        return None  # ни месяца, ни дат с точками — это не диапазон дат
+    day1, day2 = _int_in(g.get("d1"), 1, 31), _int_in(g.get("d2"), 1, 31)
+    if day1 is None or day2 is None:
+        return None
+    year1 = _year_of(g.get("y1")) or _year_of(g.get("y2")) or now.year
+    year2 = _year_of(g.get("y2")) or year1
+    try:
+        start, end = date(year1, month1, day1), date(year2, month2, day2)
+    except ValueError:
+        return None
+    if end < start:  # «с 30 декабря по 3 января» — переход через год
+        try:
+            end = end.replace(year=end.year + 1)
+        except ValueError:
+            return None
+    if end < now.date():  # прошедший период — следующий год (как в _compose)
+        try:
+            start = start.replace(year=start.year + 1)
+            end = end.replace(year=end.year + 1)
+        except ValueError:
+            return None
+    return start, end
+
+
+def local_date_period(text: str, now: datetime) -> tuple[date, date, tuple[int, int]] | None:
+    """Диапазон дат в тексте -> (первый день, последний день, span совпадения)."""
+    m = _DAYS_SPAN_RE.search(text)
+    if m:
+        start = _explicit_date(m.group("d1"), m.group("m1"), m.group("y1"),
+                               m.group("mon1"), now)
+        days = _int_in(m.group("n"), 1, 60)
+        if start is not None and days is not None:
+            return start, start + timedelta(days=days - 1), m.span()
+    m = _DATE_RANGE_RE.search(text)
+    if m:
+        pair = _range_dates(m, now)
+        if pair:
+            return pair[0], pair[1], m.span()
+    return None
+
+
+def series_start_hint(text: str, tz_name: str, now: datetime | None = None) -> datetime | None:
+    """Явное начало серии из текста («каждую среду с 7 октября») или None."""
+    now = now or datetime.now(tz=get_tz(tz_name))
+    if not local_recurrence(text):
+        return None
+    m = _SERIES_START_RE.search(text)
+    if not m:
+        return None
+    fragment = m.group("a") or m.group("b") or ""
+    d = _parse_day_month_fragment(fragment, now)
+    if d is None:
+        return None
+    return datetime(d.year, d.month, d.day, tzinfo=get_tz(tz_name))
+
+
+def _parse_day_month_fragment(fragment: str, now: datetime) -> date | None:
+    f = fragment.strip()
+    m = re.match(r"^(\d{1,2})\s*[./]\s*(\d{1,2})(?:\s*[./]\s*(\d{2,4}))?$", f)
+    if m:
+        return _explicit_date(m.group(1), m.group(2), m.group(3), None, now)
+    m = re.match(rf"^(\d{{1,2}})\s+({_MONTH_RE})$", f, re.I)
+    if m:
+        return _explicit_date(m.group(1), None, None, m.group(2), now)
+    return None
+
+
+def _draft_from_period(text: str, start_date: date, end_date: date,
+                       span: tuple[int, int], now: datetime, tz_name: str) -> EventDraft:
+    """Черновик события на несколько дней (all-day, если время не указано)."""
+    tz = get_tz(tz_name)
+    time_range = None
+    for rx in (_TIME_RANGE, _BARE_TIME_RANGE):
+        for cand in rx.finditer(text):
+            if cand.end() <= span[0] or cand.start() >= span[1]:
+                time_range = cand
+                break
+        if time_range is not None:
+            break
+    valid = _valid_time_range(time_range)
+    assumptions: list[str] = []
+    if valid:
+        start = datetime.combine(
+            start_date, time(int(time_range["h1"]), int(time_range["m1"] or 0)), tzinfo=tz
+        )
+        end = datetime.combine(
+            end_date, time(int(time_range["h2"]), int(time_range["m2"] or 0)), tzinfo=tz
+        )
+        all_day = False
+    else:
+        clock = None
+        for cand in re.finditer(r"\b(?:в|к)\s+(\d{1,2})(?::(\d{2}))?\b", text):
+            if cand.end() <= span[0] or cand.start() >= span[1]:
+                if _int_in(cand[1], 0, 23) is not None and _int_in(cand[2] or "0", 0, 59) is not None:
+                    clock = cand
+                    break
+        if clock is not None:
+            start_time = time(int(clock[1]), int(clock[2] or 0))
+            start = datetime.combine(start_date, start_time, tzinfo=tz)
+            end = datetime.combine(end_date, start_time, tzinfo=tz) + timedelta(minutes=60)
+            all_day = False
+            assumptions.append(
+                "время окончания не указано — поставил дефолт 60 минут после начала последнего дня"
+            )
+        else:
+            start = datetime.combine(start_date, time(0, 0), tzinfo=tz)
+            end = datetime.combine(end_date, time(0, 0), tzinfo=tz)
+            all_day = True
+    days = (end_date - start_date).days + 1
+    first_sentence = re.split(r"(?<!\d)[.!?](?!\d)|\n", text.strip())[0].strip()
+    return EventDraft(
+        title=(first_sentence or "Событие")[:80],
+        start=start,
+        end=end,
+        all_day=all_day,
+        extraction_note=(
+            "Локальный разбор: событие на "
+            f"{days} {_plural_days(days)}; проверьте даты и время."
+        ),
+        confidence=0.5,
+        missing=[],
+        assumptions=assumptions,
+        raw_text=text,
+    )
+
+
+def _plural_days(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "день"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "дня"
+    return "дней"
 
 
 def local_recurrence(text: str) -> dict | None:
